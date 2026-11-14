@@ -17,3 +17,5 @@ backups/
 # 工具缓存
 .pytest_cache/
 .ruff_cache/
+
+.ssh/
