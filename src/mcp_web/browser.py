@@ -63,8 +63,9 @@ class BrowserManager:
         state = settings.profiles_dir / f"{site}.json"
 
         kwargs: dict[str, Any] = {}
-        if settings.web_headless:
-            kwargs["viewport"] = {"width": 1440, "height": 900}
+        if self.headless:
+            # 无头模式给一个足够宽的视口，避免宽表格按可视宽度裁掉右侧列
+            kwargs["viewport"] = {"width": 1920, "height": 1080}
         else:
             # 可视模式下不锁死视口，让窗口最大化，避免页面右下角被屏幕裁掉
             kwargs["no_viewport"] = True

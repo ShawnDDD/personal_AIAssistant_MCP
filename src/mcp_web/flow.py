@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -61,6 +62,9 @@ class StepSpec(BaseModel):
         "set_datetime",
         "scroll_grid",
         "paginate_grid",
+        "click_prev_row",
+        "student_status",
+        "wait_ready",
     ]
     url: str | None = None
     selector: str | None = None
@@ -76,6 +80,13 @@ class StepSpec(BaseModel):
     index: int | None = None
     times: int | None = None
     optional: bool = False
+    # 点击后会在新标签页打开时置为 true，后续步骤自动切换到新页面
+    expect_popup: bool = False
+    # click_prev_row 用：日期列、分组键列、要点击的列，以及锚点日期偏移天数
+    date_column: str | None = None
+    key_column: str | None = None
+    click_column: str | None = None
+    offset_days: int = 1
     next_selector: str | None = None
     scroll_selector: str | None = None
     max_pages: int | None = None
@@ -99,6 +110,8 @@ class FlowSpec(BaseModel):
     description: str = ""
     site: str = "default"
     mode: Literal["readonly", "mutate"] = "readonly"
+    # 单条流程可覆盖全局 MCP_WEB_HEADLESS；不填走全局配置
+    headless: bool | None = None
     base_url: str = ""
     params: list[ParamSpec] = Field(default_factory=list)
     steps: list[StepSpec]
@@ -197,6 +210,8 @@ def substitute(value: Any, params: dict[str, Any]) -> Any:
 
         def replace(match: re.Match[str]) -> str:
             key = match.group(1)
+            if key == "today":
+                return date.today().isoformat()
             if key not in params:
                 raise ToolError(
                     f"变量未定义：{{{{ {key} }}}}；可用变量：{', '.join(params) or '无'}",
@@ -330,6 +345,8 @@ async def run_flow(
     policy = load_policy()
     allow_dangerous = spec.mode == "mutate"
 
+    if spec.headless is not None:
+        await manager.start(spec.headless)
     page = await manager.page(spec.site)
     variables: dict[str, Any] = {}
     log: list[dict] = []
@@ -371,6 +388,16 @@ async def run_flow(
                 entry["target"] = step.text or step.selector or f"ref={step.ref}"
                 if dry_run:
                     entry["skipped"] = "dry_run"
+                elif step.expect_popup:
+                    # 有的按钮是 window.open 打开新标签页，点击后要把后续步骤切到新页面
+                    async with page.context.expect_page(timeout=max(timeout, 10_000)) as page_info:
+                        await locator.first.click(timeout=timeout)
+                    page = await page_info.value
+                    await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+                    await page.wait_for_timeout(1500)
+                    entry["popup_url"] = page.url
+                    if step.as_:
+                        variables[step.as_] = {"url": page.url, "title": await page.title()}
                 else:
                     await locator.first.click(timeout=timeout)
 
@@ -489,6 +516,107 @@ async def run_flow(
                     variables[step.as_ or f"rows_{index}"] = rows
                     entry["rows"] = len(rows)
 
+            elif step.action == "click_prev_row":
+                if not (step.selector and step.date_column and step.key_column and step.click_column):
+                    raise ToolError(
+                        f"第 {index} 步 click_prev_row 需要 selector / date_column / key_column / click_column",
+                        code="FLOW_INVALID",
+                    )
+                entry["target"] = step.selector
+                if dry_run:
+                    entry["skipped"] = "dry_run"
+                else:
+                    target_el, picked = await _find_prev_row(page, step)
+                    entry.update(picked)
+                    if target_el is None:
+                        # 上一次课未布置作业，直接以该结论作为流程结果，后续步骤不再执行
+                        variables[step.as_ or f"detail_{index}"] = picked
+                        log.append(entry)
+                        break
+                    if step.expect_popup:
+                        async with page.context.expect_page(
+                            timeout=max(timeout, 10_000)
+                        ) as page_info:
+                            await target_el.click(timeout=timeout)
+                        page = await page_info.value
+                        await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+                        await page.wait_for_timeout(1500)
+                        entry["popup_url"] = page.url
+                        if step.as_:
+                            variables[step.as_] = {"url": page.url, "title": await page.title()}
+                    else:
+                        await target_el.click(timeout=timeout)
+
+            elif step.action == "student_status":
+                if not step.value:
+                    raise ToolError(f"第 {index} 步 student_status 缺少 value（学生姓名）", code="FLOW_INVALID")
+                student = str(substitute(step.value, params))
+                entry["student"] = student
+                if dry_run:
+                    entry["skipped"] = "dry_run"
+                    continue
+
+                header = ""
+                if step.selector:
+                    header_el = page.locator(substitute(step.selector, params)).first
+                    header = re.sub(r"\s+", " ", await header_el.inner_text()).strip()
+
+                found: dict[str, Any] = {"missing": True}
+                for _ in range(max(1, timeout // 300)):
+                    found = await page.evaluate(
+                        """(name) => {
+                            const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                            for (const tr of document.querySelectorAll('tbody tr')) {
+                                const cell = tr.querySelector('.cell-name-left [title], .cell-name-left');
+                                if (!cell) continue;
+                                const rowName = norm(cell.getAttribute('title') || cell.textContent);
+                                if (rowName !== name) continue;
+                                const el = tr.querySelector('.status-red, .status-green, .status-gray, .status-blue');
+                                return {status: el ? norm(el.textContent) : ''};
+                            }
+                            return {status: '', missing: true};
+                        }""",
+                        student,
+                    )
+                    if not found.get("missing"):
+                        break
+                    await page.wait_for_timeout(300)
+                if found.get("missing"):
+                    raise ToolError(f"页面上没有找到学生「{student}」的行", code="SELECTOR_NOT_FOUND")
+
+                status = found["status"]
+                head = _format_header(header)
+                day_match = re.search(r"\d{4}-\d{2}-\d{2}", head)
+                shot = await _snapshot(page, student, day_match.group(0) if day_match else "", status)
+                result: dict[str, Any] = {
+                    "student": student,
+                    "status": status,
+                    "header": head,
+                    "screenshot": shot,
+                }
+                if "未完成" in status:
+                    result["message"] = f"{head}，{student} 作业未完成"
+                variables[step.as_ or f"status_{index}"] = result
+                entry["status"] = status
+                entry["message"] = result.get("message", "")
+
+            elif step.action == "wait_ready":
+                # 等页面数据真正刷新：遮罩消失 + 网络静默，避免读到上一个页面的残留表格
+                mask = substitute(step.selector, params) if step.selector else ".el-loading-mask"
+                entry["target"] = mask
+                if dry_run:
+                    entry["skipped"] = "dry_run"
+                    continue
+                try:
+                    await page.wait_for_selector(mask, state="hidden", timeout=timeout)
+                except Exception:  # noqa: BLE001 - 页面没有遮罩时直接通过
+                    pass
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=min(timeout, 15000))
+                except Exception:  # noqa: BLE001 - 轮询型页面可能长期不 idle
+                    pass
+                entry["settled"] = True
+
             elif step.action == "sleep":
                 milliseconds = step.ms or 1000
                 entry["ms"] = milliseconds
@@ -545,9 +673,187 @@ async def run_flow(
     }
 
 
+def _format_header(text: str) -> str:
+    """把「老师 | 日期 课程-班次、课时 时间」整理成「老师｜日期 课程」。"""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if "|" not in text:
+        return text
+    teacher, rest = (part.strip() for part in text.split("|", 1))
+    # 去掉「-3、4/14节课 13:20-15:20」这类班次与课时尾巴
+    rest = re.sub(r"-\d+[、，,].*$", "", rest).strip()
+    return f"{teacher}｜{rest}"
+
+
+async def _scan_row_page(page: Any, step: StepSpec) -> list[dict[str, str]]:
+    """读取当前页的表格行：日期列、键列、目标列文本。"""
+    result = await page.evaluate(
+        """(args) => {
+            const rows = Array.from(document.querySelectorAll(args.selector));
+            const headerTable = Array.from(document.querySelectorAll('table'))
+                .find((t) => t.querySelectorAll('thead th').length > 0);
+            const headers = headerTable
+                ? Array.from(headerTable.querySelectorAll('thead th')).map(th => (th.innerText || '').trim())
+                : [];
+            const dIdx = headers.indexOf(args.date_column);
+            const kIdx = headers.indexOf(args.key_column);
+            const cIdx = headers.indexOf(args.click_column);
+            if (dIdx < 0 || kIdx < 0 || cIdx < 0) return {error: '表头缺少指定的列', headers};
+            return {
+                rows: rows.map((tr) => {
+                    const c = Array.from(tr.querySelectorAll('td')).map(td => (td.innerText || '').trim());
+                    return {date: c[dIdx] || '', key: c[kIdx] || '', cell_text: c[cIdx] || ''};
+                }),
+            };
+        }""",
+        {
+            "selector": step.selector,
+            "date_column": step.date_column,
+            "key_column": step.key_column,
+            "click_column": step.click_column,
+        },
+    )
+    if result.get("error"):
+        hint = f"；表头：{', '.join(result['headers'])}" if result.get("headers") else ""
+        raise ToolError(f"click_prev_row 失败：{result['error']}{hint}", code="SELECTOR_NOT_FOUND")
+    return result["rows"]
+
+
+async def _goto_page(page: Any, index: int) -> None:
+    """切到第 index 页（0 基），优先点页码，退化时用上一页按钮回退。"""
+    pager = page.locator(".el-pager li.number")
+    if await pager.count() > index:
+        await pager.nth(index).click()
+        await page.wait_for_timeout(1200)
+        return
+    prev = page.locator(".btn-prev")
+    for _ in range(30):
+        if await prev.count() == 0 or await prev.get_attribute("disabled") is not None:
+            break
+        await prev.first.click()
+        await page.wait_for_timeout(900)
+
+
+async def _snapshot(page: Any, student: str, day: str, status: str) -> str:
+    """按「学生_日期_完成情况」保存整页截图，返回绝对路径。"""
+    safe = re.sub(r"[\\/:*?\"<>|\s]+", "_", f"{student}_{day}_{status or '未知'}").strip("_")
+    shot = Path(__file__).resolve().parents[2] / "data" / "screenshots" / f"{safe}.png"
+    shot.parent.mkdir(parents=True, exist_ok=True)
+    await page.screenshot(path=str(shot), full_page=True)
+    return str(shot)
+
+
+async def _find_prev_row(page: Any, step: StepSpec) -> tuple[Any, dict[str, Any]]:
+    """找「今天 + offset_days」之后最近的一节课，取该行 key 列的值，再定位同一 key 更早的最近一行。
+
+    表格有分页时会在各页之间移动，最终回到目标行所在页并返回可点击元素。
+    """
+    anchor = (date.today() + timedelta(days=step.offset_days)).isoformat()
+
+    collected: list[list[dict[str, str]]] = []
+    max_pages = max(1, step.max_pages or 20)
+    for _ in range(max_pages):
+        collected.append(await _scan_row_page(page, step))
+        if not step.next_selector:
+            break
+        nxt = page.locator(step.next_selector).first
+        if await nxt.count() == 0:
+            break
+        if await nxt.get_attribute("disabled") is not None:
+            break
+        if "disabled" in (await nxt.get_attribute("class") or ""):
+            break
+        await nxt.click()
+        await page.wait_for_timeout(1200)
+
+    flat = [
+        (page_index, row_index, row)
+        for page_index, rows in enumerate(collected)
+        for row_index, row in enumerate(rows)
+    ]
+    if not flat:
+        raise ToolError("click_prev_row 失败：表格没有数据行", code="SELECTOR_NOT_FOUND")
+
+    upcoming = [item for item in flat if item[2]["date"] and item[2]["date"] >= anchor]
+    if not upcoming:
+        raise ToolError(f"click_prev_row 失败：{anchor} 及之后没有排课", code="SELECTOR_NOT_FOUND")
+    _, _, anchor_data = min(upcoming, key=lambda x: (x[2]["date"], x[0], x[1]))
+    key = anchor_data["key"]
+
+    earlier = [
+        item
+        for item in flat
+        if item[2]["key"] == key and item[2]["date"] and item[2]["date"] < anchor_data["date"]
+    ]
+    if not earlier:
+        raise ToolError(f"click_prev_row 失败：{key} 在该日期之前没有更早的记录", code="SELECTOR_NOT_FOUND")
+    target_page, target_row, target_data = max(earlier, key=lambda x: (x[2]["date"], x[0], x[1]))
+
+    if target_page != len(collected) - 1:
+        await _goto_page(page, target_page)
+
+    row = page.locator(step.selector).nth(target_row)
+    cell_index = await _cell_index(page, step)
+    cell = row.locator("td").nth(cell_index)
+    cell_text = target_data["cell_text"]
+    if cell_text in ("", "--", "-"):
+        student = str(substitute(step.value, params)) if step.value else ""
+        shot = await _snapshot(page, student, target_data["date"], "未布置")
+        picked = {
+            "anchor_date": anchor_data["date"],
+            "key": key,
+            "row_date": target_data["date"],
+            "cell_text": cell_text or "--",
+            "status": "未布置",
+            "no_detail": True,
+            "message": f"{key}｜{target_data['date']} 该次课未布置作业，无作业完成情况",
+            "screenshot": shot,
+        }
+        return None, picked
+
+    target = cell
+    inner = cell.locator("span, a, button")
+    for i in range(await inner.count()):
+        element = inner.nth(i)
+        if (await element.inner_text()).strip() == cell_text:
+            target = element
+            break
+
+    picked = {
+        "anchor_date": anchor_data["date"],
+        "key": key,
+        "row_date": target_data["date"],
+        "cell_text": cell_text,
+        "pages": len(collected),
+        "row_index": target_row,
+    }
+    return target, picked
+
+
+async def _cell_index(page: Any, step: StepSpec) -> int:
+    """取 click_column 在表头中的列下标。"""
+    index = await page.evaluate(
+        """(name) => {
+            const headerTable = Array.from(document.querySelectorAll('table'))
+                .find((t) => t.querySelectorAll('thead th').length > 0);
+            if (!headerTable) return -1;
+            return Array.from(headerTable.querySelectorAll('thead th'))
+                .map(th => (th.innerText || '').trim()).indexOf(name);
+        }""",
+        step.click_column,
+    )
+    if index is None or index < 0:
+        raise ToolError(f"click_prev_row 失败：表头没有「{step.click_column}」列", code="SELECTOR_NOT_FOUND")
+    return index
+
+
 def _build_output(spec: FlowSpec, variables: dict[str, Any]) -> Any:
     if spec.output:
         source = spec.output.get("from")
+        if not (isinstance(source, str) and source in variables):
+            for candidate in spec.output.get("from_any") or []:
+                if isinstance(candidate, str) and candidate in variables:
+                    source = candidate
+                    break
         if isinstance(source, str) and source in variables:
             data = variables[source]
             where = spec.output.get("where")

@@ -1,0 +1,124 @@
+name: homework_query
+description: 作业完成情况查询：按学生姓名定位班级，进入「学情/作业」页面（只读）
+site: talkweb
+mode: readonly
+# 后台静默执行，不弹出浏览器窗口
+headless: true
+# 系统入口不放仓库，写在本地 .env
+base_url: "{{ env.TALKWEB_BASE_URL }}"
+
+params:
+  - name: student
+    type: str
+    required: true
+  - name: date
+    type: str
+    required: false
+    default: "{{ today }}"
+  - name: manager
+    type: str
+    required: false
+    default: "{{ env.TALKWEB_MANAGER }}"
+
+steps:
+  - action: goto
+    url: /talkweb/#/vueSystem5031/vueSystem5033/student-class-manage-class-list
+
+  - action: wait_for
+    selector: 'input[placeholder="学生姓名"]'
+    timeout_ms: 30000
+
+  - action: fill
+    selector: 'input[placeholder="学生姓名"]'
+    value: "{{ student }}"
+
+  # 学管是 el-select（多选 + 可搜索），先点开输入框再输入过滤
+  - action: click
+    selector: '.el-form-item:has(input[placeholder="请选择学管"]) input.el-select__input'
+
+  - action: fill
+    selector: '.el-form-item:has(input[placeholder="请选择学管"]) input.el-select__input'
+    value: "{{ manager }}"
+
+  - action: wait_for
+    selector: '.el-select-dropdown:visible .el-select-dropdown__item'
+    timeout_ms: 10000
+
+  - action: click
+    selector: '.el-select-dropdown:visible .el-select-dropdown__item:has-text("{{ manager }}")'
+
+  - action: click
+    selector: 'button:has-text("查询")'
+
+  - action: wait_for
+    selector: 'button:has-text("班级信息")'
+    timeout_ms: 30000
+
+  # 进入班级详情
+  - action: click
+    selector: 'button:has-text("班级信息")'
+
+  # 等路由切换+接口返回，避免读到上一个页面残留的数据
+  - action: wait_ready
+    timeout_ms: 30000
+
+  - action: wait_for
+    selector: 'div.btn:has-text("学情/作业")'
+    timeout_ms: 30000
+
+  # 该按钮会新开标签页，点击后流程切到新页面
+  - action: click
+    selector: 'div.btn:has-text("学情/作业")'
+    expect_popup: true
+    as: homework_page
+
+  - action: wait_ready
+    timeout_ms: 30000
+
+  - action: wait_for
+    selector: '.tab-item'
+    timeout_ms: 30000
+
+  # 课中练习：表格列为 总课次/老师/上课日期/练习情况/学生完成情况/最新操作时间/操作
+  - action: click
+    selector: '.tab-item:has-text("课中练习")'
+
+  - action: wait_ready
+    timeout_ms: 30000
+
+  - action: wait_for
+    selector: 'th:has-text("学生完成情况")'
+    timeout_ms: 30000
+
+  - action: wait_for
+    selector: 'tbody tr'
+    timeout_ms: 30000
+
+  # 取「今天 + offset_days」之后最近的一节课（不要求正好是次日），
+  # 再找该老师在那一节课之前最近的一次课，点它的「学生完成情况」
+  - action: click_prev_row
+    selector: 'tbody tr'
+    date_column: 上课日期
+    key_column: 老师
+    click_column: 学生完成情况
+    offset_days: 1
+    next_selector: '.el-pagination .btn-next'
+    max_pages: 20
+    expect_popup: true
+    value: "{{ student }}"
+    as: practice_detail
+
+  - action: wait_for
+    selector: '.part-left p'
+    timeout_ms: 30000
+
+  # 定位学生行读完成情况；无论未完成/已完成/未布置都会留一张截图
+  - action: student_status
+    selector: '.part-left p'
+    value: "{{ student }}"
+    as: practice_status
+
+output:
+  from_any:
+    - practice_status
+    - practice_detail
