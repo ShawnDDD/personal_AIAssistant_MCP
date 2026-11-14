@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 本地配置与凭据
+.env
+
+# 运行期数据（导出文件、浏览器登录态、运行记录）
+data/
+backups/
+*.log
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/

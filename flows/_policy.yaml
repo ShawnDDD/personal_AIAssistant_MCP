@@ -1,0 +1,14 @@
+# 只读模式下，点击文本命中以下任一关键词会被拦截（返回 BLOCKED_MUTATION）。
+# 需要写操作时，在流程里声明 mode: mutate，或在调用 web_click 时传 allow_dangerous=true。
+blocked:
+  - 提交
+  - 保存
+  - 删除
+  - 审批通过
+  - 驳回
+  - 发布
+  - 支付
+  - 下单
+  - 退订
+  - 作废
+  - 停用

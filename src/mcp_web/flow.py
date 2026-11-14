@@ -1,0 +1,575 @@
+"""YAML 流程引擎：加载、校验、执行。
+
+设计约束：
+- 变量只来自 params，用 {{ name }} 引用，不做表达式运算；
+- 未知 action / 未知字段 / 未定义变量在加载或执行前报错，并指出位置；
+- 默认只读，click 命中危险词会被 policy 拦截。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+from pathlib import Path
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from mcp_common.config import get_settings
+from mcp_common.errors import ToolError
+
+from .extract import (
+    element_text,
+    extract_fields,
+    extract_table,
+    paginate_grid,
+    resolve_locator,
+    scroll_grid,
+    set_datetime,
+)
+from .policy import load_policy
+
+_VAR_PATTERN = re.compile(r"\{\{\s*([a-zA-Z_][\w]*)\s*\}\}")
+_ENV_PATTERN = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+
+class ParamSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    type: Literal["str", "int", "bool", "date"] = "str"
+    required: bool = False
+    default: Any = None
+
+
+class StepSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    action: Literal[
+        "goto",
+        "fill",
+        "click",
+        "select",
+        "press",
+        "wait_for",
+        "extract",
+        "extract_table",
+        "download",
+        "sleep",
+        "assert",
+        "set_datetime",
+        "scroll_grid",
+        "paginate_grid",
+    ]
+    url: str | None = None
+    selector: str | None = None
+    ref: int | None = None
+    text: str | None = None
+    value: Any = None
+    label: str | None = None
+    key: str | None = None
+    fields: dict[str, str] | None = None
+    as_: str | None = Field(default=None, alias="as")
+    timeout_ms: int | None = None
+    ms: int | None = None
+    index: int | None = None
+    times: int | None = None
+    optional: bool = False
+    next_selector: str | None = None
+    scroll_selector: str | None = None
+    max_pages: int | None = None
+    scroll_times: int | None = None
+
+
+class PaginateSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    next_selector: str | None = None
+    table_selector: str | None = None
+    max_pages: int = 20
+    dedupe_by: list[str] | None = None
+    stop_when: str | None = None
+
+
+class FlowSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str = ""
+    site: str = "default"
+    mode: Literal["readonly", "mutate"] = "readonly"
+    base_url: str = ""
+    params: list[ParamSpec] = Field(default_factory=list)
+    steps: list[StepSpec]
+    paginate: PaginateSpec | None = None
+    output: dict[str, Any] | None = None
+
+
+def _format_validation(exc: ValidationError) -> str:
+    lines = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error["loc"])
+        lines.append(f"  - {location}: {error['msg']}")
+    return "\n".join(lines)
+
+
+def resolve_path(name_or_path: str) -> Path:
+    candidate = Path(name_or_path).expanduser()
+    if candidate.is_file():
+        return candidate
+
+    directory = get_settings().flows_dir
+    for option in (directory / f"{name_or_path}.yaml", directory / name_or_path):
+        if option.is_file():
+            return option
+
+    available = sorted(path.stem for path in directory.glob("*.yaml") if not path.name.startswith("_"))
+    raise ToolError(
+        f"找不到流程：{name_or_path}；可用流程：{', '.join(available) or '无'}",
+        code="FLOW_INVALID",
+    )
+
+
+def load_flow(name_or_path: str) -> FlowSpec:
+    import yaml
+
+    path = resolve_path(name_or_path)
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ToolError(f"YAML 解析失败（{path.name}）：{exc}", code="FLOW_INVALID") from exc
+
+    if not isinstance(data, dict):
+        raise ToolError(f"流程文件必须是 YAML 映射（{path.name}）", code="FLOW_INVALID")
+
+    try:
+        return FlowSpec.model_validate(data)
+    except ValidationError as exc:
+        raise ToolError(
+            f"流程校验失败（{path.name}）：\n{_format_validation(exc)}",
+            code="FLOW_INVALID",
+        ) from exc
+
+
+def list_flows() -> list[dict]:
+    directory = get_settings().flows_dir
+    if not directory.is_dir():
+        return []
+
+    items: list[dict] = []
+    for path in sorted(directory.glob("*.yaml")):
+        if path.name.startswith("_"):
+            continue
+        try:
+            spec = load_flow(str(path))
+        except ToolError as exc:
+            items.append({"name": path.stem, "file": path.name, "error": exc.message})
+            continue
+
+        items.append(
+            {
+                "name": spec.name,
+                "file": path.name,
+                "site": spec.site,
+                "mode": spec.mode,
+                "description": spec.description,
+                "params": [{"name": p.name, "required": p.required, "default": p.default} for p in spec.params],
+            }
+        )
+    return items
+
+
+def substitute(value: Any, params: dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        def replace_env(match: re.Match[str]) -> str:
+            name = match.group(1)
+            resolved = os.environ.get(name, "")
+            if not resolved:
+                raise ToolError(
+                    f"环境变量未设置：{name}；请在本地 .env 中配置（参考 .env.example）",
+                    code="FLOW_INVALID",
+                )
+            return resolved
+
+        value = _ENV_PATTERN.sub(replace_env, value)
+
+        def replace(match: re.Match[str]) -> str:
+            key = match.group(1)
+            if key not in params:
+                raise ToolError(
+                    f"变量未定义：{{{{ {key} }}}}；可用变量：{', '.join(params) or '无'}",
+                    code="FLOW_INVALID",
+                )
+            return str(params[key])
+
+        return _VAR_PATTERN.sub(replace, value)
+
+    if isinstance(value, list):
+        return [substitute(item, params) for item in value]
+    if isinstance(value, dict):
+        return {key: substitute(item, params) for key, item in value.items()}
+    return value
+
+
+def resolve_params(spec: FlowSpec, provided: dict[str, Any] | None) -> dict[str, Any]:
+    provided = provided or {}
+    resolved: dict[str, Any] = {}
+    missing: list[str] = []
+
+    for param in spec.params:
+        value = provided.get(param.name)
+        if value is not None:
+            resolved[param.name] = value
+        elif param.default is not None:
+            # 默认值里可能引用环境变量（如 {{ env.ERP_MANAGER }}），这里先解析
+            resolved[param.name] = substitute(param.default, {})
+        elif param.required:
+            missing.append(param.name)
+        else:
+            resolved[param.name] = ""
+
+    if missing:
+        available = ", ".join(p.name for p in spec.params) or "无"
+        raise ToolError(
+            f"缺少必填参数：{', '.join(missing)}；该流程参数：{available}",
+            code="MISSING_PARAMS",
+        )
+
+    return resolved
+
+
+def _absolute_url(base_url: str, url: str) -> str:
+    if url.startswith(("http://", "https://", "file://")):
+        return url
+    if not base_url:
+        return url
+    return base_url.rstrip("/") + "/" + url.lstrip("/")
+
+
+async def _paginate(
+    page: Any,
+    spec: FlowSpec,
+    params: dict[str, Any],
+    dry_run: bool,
+) -> dict | None:
+    paginate = spec.paginate
+    if paginate is None:
+        return None
+
+    selector = substitute(paginate.table_selector, params) if paginate.table_selector else None
+    first = await extract_table(page, selector)
+    headers = first["headers"]
+    rows = list(first["rows"])
+    page_count = 1
+
+    step_limit = max(paginate.max_pages - 1, 0)
+    clicked = 0
+
+    while clicked < step_limit:
+        if paginate.stop_when:
+            stop_selector = substitute(paginate.stop_when, params)
+            if await page.locator(stop_selector).count() > 0:
+                break
+
+        if not paginate.next_selector:
+            break
+
+        next_selector = substitute(paginate.next_selector, params)
+        button = page.locator(next_selector)
+        if await button.count() == 0:
+            break
+
+        first_button = button.first
+        classes = (await first_button.get_attribute("class")) or ""
+        if await first_button.get_attribute("disabled") is not None or "disabled" in classes:
+            break
+
+        if dry_run:
+            break
+
+        await first_button.click()
+        try:
+            await page.wait_for_load_state("networkidle", timeout=get_settings().web_timeout_ms)
+        except Exception:  # noqa: BLE001 - 有些页面永远不会 idle
+            pass
+        await page.wait_for_timeout(300)
+
+        current = await extract_table(page, selector)
+        if current["headers"] != headers:
+            headers = current["headers"]
+        rows.extend(current["rows"])
+        page_count += 1
+        clicked += 1
+
+    truncated = (not dry_run) and step_limit > 0 and clicked >= step_limit
+
+    if paginate.dedupe_by:
+        seen: set[tuple] = set()
+        unique: list[dict] = []
+        for row in rows:
+            key = tuple(str(row.get(name, "")).strip() for name in paginate.dedupe_by)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(row)
+        rows = unique
+
+    return {"headers": headers, "rows": rows, "page_count": page_count, "truncated": truncated}
+
+
+async def run_flow(
+    manager: Any,
+    spec: FlowSpec,
+    params: dict[str, Any],
+    dry_run: bool = False,
+    run_dir: Path | None = None,
+) -> dict:
+    settings = get_settings()
+    policy = load_policy()
+    allow_dangerous = spec.mode == "mutate"
+
+    page = await manager.page(spec.site)
+    variables: dict[str, Any] = {}
+    log: list[dict] = []
+    warnings: list[str] = []
+    index = 0
+
+    try:
+        for index, step in enumerate(spec.steps, start=1):
+            entry: dict[str, Any] = {"step": index, "action": step.action}
+            timeout = step.timeout_ms or settings.web_timeout_ms
+
+            if step.action == "goto":
+                url = substitute(step.url, params) if step.url else ""
+                if not url:
+                    raise ToolError(f"第 {index} 步 goto 缺少 url", code="FLOW_INVALID")
+                entry["url"] = _absolute_url(substitute(spec.base_url, params), url)
+                await page.goto(entry["url"], wait_until="domcontentloaded")
+
+            elif step.action == "fill":
+                if step.value is None:
+                    raise ToolError(f"第 {index} 步 fill 缺少 value", code="FLOW_INVALID")
+                locator = resolve_locator(page, step.ref, step.selector, None)
+                value = str(substitute(step.value, params))
+                entry["target"] = step.selector or f"ref={step.ref}"
+                entry["value"] = value
+                await locator.first.fill(value, timeout=timeout)
+                if step.key:
+                    await locator.first.press(step.key)
+
+            elif step.action == "click":
+                locator = resolve_locator(
+                    page,
+                    step.ref,
+                    substitute(step.selector, params) if step.selector else None,
+                    substitute(step.text, params) if step.text else None,
+                )
+                label = step.text or await element_text(locator)
+                policy.check(label, allow=allow_dangerous)
+                entry["target"] = step.text or step.selector or f"ref={step.ref}"
+                if dry_run:
+                    entry["skipped"] = "dry_run"
+                else:
+                    await locator.first.click(timeout=timeout)
+
+            elif step.action == "select":
+                locator = resolve_locator(page, step.ref, step.selector, None)
+                label = substitute(step.label, params) if step.label else None
+                value = substitute(step.value, params) if step.value is not None else None
+                entry["target"] = step.selector or f"ref={step.ref}"
+                if dry_run:
+                    entry["skipped"] = "dry_run"
+                elif label is not None:
+                    await locator.first.select_option(label=str(label), timeout=timeout)
+                elif value is not None:
+                    await locator.first.select_option(value=str(value), timeout=timeout)
+                else:
+                    raise ToolError(f"第 {index} 步 select 需要 value 或 label", code="FLOW_INVALID")
+
+            elif step.action == "press":
+                if not step.key:
+                    raise ToolError(f"第 {index} 步 press 缺少 key", code="FLOW_INVALID")
+                entry["key"] = step.key
+                if not dry_run:
+                    await page.keyboard.press(step.key)
+
+            elif step.action == "wait_for":
+                entry["target"] = step.selector or step.text or "networkidle"
+                if step.selector:
+                    await page.wait_for_selector(substitute(step.selector, params), timeout=timeout)
+                elif step.text:
+                    await page.get_by_text(substitute(step.text, params)).first.wait_for(timeout=timeout)
+                else:
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=timeout)
+                    except Exception:  # noqa: BLE001
+                        warnings.append(f"第 {index} 步等待 networkidle 超时，已继续")
+
+            elif step.action == "extract":
+                if not step.fields:
+                    raise ToolError(f"第 {index} 步 extract 缺少 fields", code="FLOW_INVALID")
+                data = await extract_fields(
+                    page,
+                    substitute(step.selector, params) if step.selector else None,
+                    {key: substitute(value, params) for key, value in step.fields.items()},
+                )
+                variables[step.as_ or f"extract_{index}"] = data
+                entry["as"] = step.as_ or f"extract_{index}"
+
+            elif step.action == "extract_table":
+                try:
+                    data = await extract_table(
+                        page,
+                        substitute(step.selector, params) if step.selector else None,
+                    )
+                except ToolError:
+                    if not step.optional:
+                        raise
+                    data = {"rows": [], "headers": []}
+                variables[step.as_ or f"table_{index}"] = data["rows"]
+                entry["as"] = step.as_ or f"table_{index}"
+                entry["rows"] = len(data["rows"])
+
+            elif step.action == "set_datetime":
+                if not step.selector or step.value is None:
+                    raise ToolError(
+                        f"第 {index} 步 set_datetime 缺少 selector 或 value",
+                        code="FLOW_INVALID",
+                    )
+                value = str(substitute(step.value, params))
+                entry["target"] = step.selector
+                entry["value"] = value
+                if dry_run:
+                    entry["skipped"] = "dry_run"
+                else:
+                    await set_datetime(
+                        page,
+                        substitute(step.selector, params),
+                        step.index or 0,
+                        value,
+                        timeout,
+                    )
+
+            elif step.action == "scroll_grid":
+                if not step.selector:
+                    raise ToolError(f"第 {index} 步 scroll_grid 缺少 selector", code="FLOW_INVALID")
+                entry["target"] = step.selector
+                entry["times"] = step.times or 1
+                if dry_run:
+                    entry["skipped"] = "dry_run"
+                else:
+                    entry["rendered_columns"] = await scroll_grid(
+                        page,
+                        substitute(step.selector, params),
+                        step.times or 1,
+                        step.ms or 600,
+                    )
+
+            elif step.action == "paginate_grid":
+                if not step.selector or not step.next_selector:
+                    raise ToolError(
+                        f"第 {index} 步 paginate_grid 缺少 selector 或 next_selector",
+                        code="FLOW_INVALID",
+                    )
+                entry["target"] = step.selector
+                if dry_run:
+                    entry["skipped"] = "dry_run"
+                    variables[step.as_ or f"rows_{index}"] = []
+                else:
+                    rows = await paginate_grid(
+                        page,
+                        substitute(step.selector, params),
+                        substitute(step.scroll_selector or step.selector, params),
+                        substitute(step.next_selector, params),
+                        step.max_pages or 20,
+                        step.scroll_times or 5,
+                    )
+                    variables[step.as_ or f"rows_{index}"] = rows
+                    entry["rows"] = len(rows)
+
+            elif step.action == "sleep":
+                milliseconds = step.ms or 1000
+                entry["ms"] = milliseconds
+                if not dry_run:
+                    await asyncio.sleep(milliseconds / 1000)
+
+            elif step.action == "assert":
+                locator = resolve_locator(
+                    page,
+                    step.ref,
+                    substitute(step.selector, params) if step.selector else None,
+                    substitute(step.text, params) if step.text else None,
+                )
+                if await locator.count() == 0:
+                    raise ToolError(
+                        f"第 {index} 步断言失败，元素不存在：{step.selector or step.text or step.ref}",
+                        code="SELECTOR_NOT_FOUND",
+                    )
+
+            log.append(entry)
+
+        paginated = await _paginate(page, spec, params, dry_run)
+
+    except ToolError as exc:
+        if run_dir is not None:
+            await _save_failure(page, run_dir, index)
+        raise
+    except Exception as exc:  # noqa: BLE001 - 统一翻译成可操作错误
+        if run_dir is not None:
+            await _save_failure(page, run_dir, index)
+        raise ToolError(f"流程执行失败：{exc}", code="BROWSER_ERROR") from exc
+
+    if paginated is not None:
+        data: Any = paginated["rows"]
+        page_count = paginated["page_count"]
+        truncated = paginated["truncated"]
+        if truncated:
+            warnings.append(f"翻页达到上限 {spec.paginate.max_pages if spec.paginate else 0} 页，结果可能不完整")
+    else:
+        data = _build_output(spec, variables)
+        page_count = 1
+        truncated = False
+
+    if dry_run:
+        warnings.append("dry_run 模式：未执行 click / select / press / download")
+
+    return {
+        "data": data,
+        "warnings": warnings,
+        "log": log,
+        "page_count": page_count,
+        "truncated": truncated,
+        "mode": spec.mode,
+    }
+
+
+def _build_output(spec: FlowSpec, variables: dict[str, Any]) -> Any:
+    if spec.output:
+        source = spec.output.get("from")
+        if isinstance(source, str) and source in variables:
+            data = variables[source]
+            where = spec.output.get("where")
+            if isinstance(data, list) and isinstance(where, dict):
+                # 只保留指定列等于给定值的行，例如只取某个学管的记录
+                data = [
+                    row
+                    for row in data
+                    if isinstance(row, dict)
+                    and all(str(row.get(key, "")) == str(value) for key, value in where.items())
+                ]
+            return data
+    if len(variables) == 1:
+        return next(iter(variables.values()))
+    return variables
+
+
+async def _save_failure(page: Any, run_dir: Path, step: int) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        await page.screenshot(path=str(run_dir / f"error-step{step}.png"), full_page=True)
+        html = await page.content()
+        (run_dir / f"error-step{step}.html").write_text(html, encoding="utf-8")
+    except Exception:  # noqa: BLE001 - 保存现场失败不应掩盖原始错误
+        pass

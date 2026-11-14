@@ -1,0 +1,67 @@
+name: erp_attendance_query
+description: 一对一打卡查询：按日期范围查询学员打卡情况，只读不点击
+site: erp
+mode: readonly
+# 真实系统地址放在本地 .env 的 ERP_BASE_URL，不随仓库提交
+base_url: "{{ env.ERP_BASE_URL }}"
+
+# 前置条件：data/profiles/erp.json 已保存有效登录态
+# 页面表格为 ag-Grid（div 渲染），列与行都做了虚拟渲染：
+#   - 右侧列需要横向滚动（并把 scrollLeft 推到最右）才会进入 DOM
+#   - 每页 10 条，需要逐页翻页才能拿全范围内数据
+#   - 每页内只渲染当前视口可见的几行，需要纵向分屏滚动
+
+params:
+  - name: start_date
+    type: str
+    required: true          # 起始日期 YYYY-MM-DD，例如 2026-11-13
+  - name: end_date
+    type: str
+    required: true          # 结束日期 YYYY-MM-DD；查单日时与 start_date 填同一天
+  - name: manager
+    type: str
+    required: false
+    default: "{{ env.ERP_MANAGER }}"   # 学管姓名，默认取本地 .env 配置
+
+steps:
+  - action: goto
+    url: /c3h5/attendance/high-lesson-details
+
+  - action: wait_for
+    selector: 'input[placeholder="请输入学员姓名"]'
+    timeout_ms: 20000
+
+  - action: set_datetime
+    selector: '.el-date-editor--datetime input'
+    index: 0
+    value: "{{ start_date }} 00:00:00"
+
+  - action: set_datetime
+    selector: '.el-date-editor--datetime input'
+    index: 1
+    value: "{{ end_date }} 23:59:59"
+
+  # 关键：接口的 manager 参数来自这个输入框，留空就会返回全部学管的数据
+  - action: fill
+    selector: 'input[placeholder="请输入学管"]'
+    value: "{{ manager }}"
+
+  # 用 button 限定，避免误点左侧菜单「考勤查询」
+  - action: click
+    selector: 'button:has-text("查询")'
+
+  - action: sleep
+    ms: 7000
+
+  # 逐页：横向滚到学管列区 → 纵向分屏抽取 → 下一页，自动按 row-index 合并
+  - action: paginate_grid
+    selector: '.ag-root'
+    scroll_selector: '.ag-center-cols-viewport'
+    next_selector: '.el-pagination .btn-next'
+    max_pages: 300
+    scroll_times: 12
+    as: rows
+
+# 学管条件已由服务端 manager 参数过滤，这里直接输出
+output:
+  from: rows

@@ -1,0 +1,48 @@
+[project]
+name = "mcp-suite"
+version = "0.1.0"
+description = "MCP servers for web automation and Excel"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.3",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "openpyxl>=3.1",
+    "pandas>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+# P2/P3 的依赖，用到时再装：pip install -e ".[web]"
+web = [
+    "httpx>=0.27",
+    "tenacity>=8.3",
+    "playwright>=1.44",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+mcp-excel = "mcp_excel.server:main"
+mcp-web = "mcp_web.server:main"
+
+# 用 hatchling：不在 src/ 下生成 egg-info，避免 Windows 上目录被占用导致无法重装
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_common", "src/mcp_excel", "src/mcp_web"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,42 @@
+# 流程模板：复制为 <站点>_<场景>.yaml 后按实际情况修改。
+# 文件名以下划线开头不会被 web_flow_list 列出。
+name: example_query
+description: 示例：按条件查询列表并翻页
+site: example                             # 对应 data/profiles/example.json
+mode: readonly                            # readonly / mutate
+base_url: https://example.com
+
+params:
+  - name: keyword
+    type: str
+    required: true
+  - name: start_date
+    type: date
+    required: false
+    default: ""
+
+steps:
+  - action: goto
+    url: /query
+
+  # 很多日期控件是 readonly 的，用 web_set_date 对应的做法在流程里无法直接表达，
+  # 若遇到此类控件，先在这里用 fill 试，失败再改用 click 逐步选择。
+  - action: fill
+    selector: "#keyword"
+    value: "{{ keyword }}"
+
+  - action: click
+    text: "查询"
+
+  - action: wait_for
+    selector: "#resultTable tbody tr"
+    timeout_ms: 10000
+
+paginate:
+  next_selector: ".pagination .next:not(.disabled)"
+  table_selector: "#resultTable"
+  max_pages: 20
+  dedupe_by: ["订单号"]
+
+output:
+  from: rows
