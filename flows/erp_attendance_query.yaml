@@ -2,6 +2,8 @@ name: erp_attendance_query
 description: 一对一打卡查询：按日期范围查询学员打卡情况，只读不点击
 site: erp
 mode: readonly
+# 后台静默执行，不弹出浏览器窗口
+headless: true
 # 真实系统地址放在本地 .env 的 ERP_BASE_URL，不随仓库提交
 base_url: "{{ env.ERP_BASE_URL }}"
 
@@ -61,6 +63,13 @@ steps:
     max_pages: 300
     scroll_times: 12
     as: rows
+
+  # 查询结果留一张截图（表格是虚拟滚动，先归零滚动再截当前视口）
+  - action: screenshot
+    path: "data/screenshots/一对一打卡_{{ start_date }}_{{ end_date }}.png"
+    full_page: false
+    reset_scroll: '.ag-root .ag-center-cols-viewport, .ag-root .ag-body-viewport, .ag-root .ag-body-horizontal-scroll-viewport'
+    as: screenshot
 
 # 学管条件已由服务端 manager 参数过滤，这里直接输出
 output:

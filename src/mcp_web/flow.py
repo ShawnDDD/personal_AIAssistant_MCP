@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -65,6 +65,7 @@ class StepSpec(BaseModel):
         "click_prev_row",
         "student_status",
         "wait_ready",
+        "screenshot",
     ]
     url: str | None = None
     selector: str | None = None
@@ -91,6 +92,11 @@ class StepSpec(BaseModel):
     scroll_selector: str | None = None
     max_pages: int | None = None
     scroll_times: int | None = None
+    # screenshot 用：保存路径（支持 {{ param }}，相对项目根目录）；full_page 控制整页还是当前视口
+    path: str | None = None
+    full_page: bool = True
+    # 截图前把匹配元素的滚动位置归零，避免截到滚动到一半的空表格
+    reset_scroll: str | None = None
 
 
 class PaginateSpec(BaseModel):
@@ -616,6 +622,35 @@ async def run_flow(
                 except Exception:  # noqa: BLE001 - 轮询型页面可能长期不 idle
                     pass
                 entry["settled"] = True
+
+            elif step.action == "screenshot":
+                entry["target"] = "page"
+                if dry_run:
+                    entry["skipped"] = "dry_run"
+                    continue
+                root = Path(__file__).resolve().parents[2]
+                if step.path:
+                    shot = Path(substitute(step.path, params)).expanduser()
+                    if not shot.is_absolute():
+                        shot = root / shot
+                else:
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    shot = root / "data" / "screenshots" / f"{spec.name}_{stamp}.png"
+                shot.parent.mkdir(parents=True, exist_ok=True)
+                if step.reset_scroll:
+                    await page.evaluate(
+                        """(sel) => {
+                            document.querySelectorAll(sel).forEach((el) => {
+                                el.scrollLeft = 0;
+                                el.scrollTop = 0;
+                            });
+                        }""",
+                        substitute(step.reset_scroll, params),
+                    )
+                    await page.wait_for_timeout(800)
+                await page.screenshot(path=str(shot), full_page=step.full_page)
+                entry["path"] = str(shot)
+                variables[step.as_ or "screenshot"] = str(shot)
 
             elif step.action == "sleep":
                 milliseconds = step.ms or 1000
