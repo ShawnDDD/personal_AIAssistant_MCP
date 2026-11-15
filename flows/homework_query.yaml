@@ -47,12 +47,23 @@ steps:
   - action: click
     selector: '.el-select-dropdown:visible .el-select-dropdown__item:has-text("{{ manager }}")'
 
+  # 选完学管后再次确认学生姓名（避免被表单重渲染清空导致查出全部班级）
+  - action: fill
+    selector: 'input[placeholder="学生姓名"]'
+    value: "{{ student }}"
+
+  # 等查询接口返回，确保表格已刷新到本次结果（避免点到上一次查询的旧行）
   - action: click
     selector: 'button:has-text("查询")'
+    expect_response: 'classTable/list'
 
   - action: wait_for
     selector: 'button:has-text("班级信息")'
     timeout_ms: 30000
+
+  # 隐藏右下角 Copilot 气泡等浮层，避免遮挡点击
+  - action: hide
+    selector: '.layout-pop'
 
   # 进入班级详情
   - action: click
@@ -101,7 +112,10 @@ steps:
     date_column: 上课日期
     key_column: 老师
     click_column: 学生完成情况
+    lesson_column: 总课次
     offset_days: 1
+    # 已结课（没有未来排课）时，改为汇总最近 30 天的作业完成情况
+    fallback_days: 30
     next_selector: '.el-pagination .btn-next'
     max_pages: 20
     expect_popup: true
@@ -113,9 +127,11 @@ steps:
     timeout_ms: 30000
 
   # 定位学生行读完成情况；无论未完成/已完成/未布置都会留一张截图
+  # anchor_from：把锚点课（未来最近一节课）的信息一并带进结果
   - action: student_status
     selector: '.part-left p'
     value: "{{ student }}"
+    anchor_from: practice_detail
     as: practice_status
 
 output:

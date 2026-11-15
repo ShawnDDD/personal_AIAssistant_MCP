@@ -19,3 +19,6 @@ backups/
 .ruff_cache/
 
 .ssh/
+
+# 本机 MCP 注册（含绝对路径，不随仓库分发）
+.trae/mcp.json

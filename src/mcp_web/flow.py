@@ -66,6 +66,7 @@ class StepSpec(BaseModel):
         "student_status",
         "wait_ready",
         "reveal_on_match",
+        "hide",
     ]
     url: str | None = None
     selector: str | None = None
@@ -83,6 +84,8 @@ class StepSpec(BaseModel):
     optional: bool = False
     # 点击后会在新标签页打开时置为 true，后续步骤自动切换到新页面
     expect_popup: bool = False
+    # 点击后等待响应 URL 包含该子串，确保数据已刷新
+    expect_response: str | None = None
     # click_prev_row 用：日期列、分组键列、要点击的列，以及锚点日期偏移天数
     date_column: str | None = None
     key_column: str | None = None
@@ -92,6 +95,12 @@ class StepSpec(BaseModel):
     scroll_selector: str | None = None
     max_pages: int | None = None
     scroll_times: int | None = None
+    # click_prev_row 用：总课次列名（可选），用于把锚点课的节次带进结果
+    lesson_column: str | None = None
+    # student_status 用：把指定变量里的锚点课程信息合并进结果，便于人工复核
+    anchor_from: str | None = None
+    # click_prev_row 用：没有未来排课时，回看最近 N 天的作业完成情况（0 表示不回看）
+    fallback_days: int = 0
     # reveal_on_match 用：数据来源变量、判断列、命中后弹出有头浏览器的触发值
     from_var: str | None = Field(default=None, alias="from")
     match_column: str | None = None
@@ -404,6 +413,15 @@ async def run_flow(
                     entry["popup_url"] = page.url
                     if step.as_:
                         variables[step.as_] = {"url": page.url, "title": await page.title()}
+                elif step.expect_response:
+                    # 点完等接口返回，确保表格已刷新到新结果（避免读到旧行）
+                    async with page.expect_response(
+                        lambda r: step.expect_response in r.url, timeout=timeout
+                    ) as resp_info:
+                        await locator.first.click(timeout=timeout)
+                    await page.wait_for_timeout(600)
+                    response = await resp_info.value
+                    entry["response"] = response.url
                 else:
                     await locator.first.click(timeout=timeout)
 
@@ -532,7 +550,25 @@ async def run_flow(
                 if dry_run:
                     entry["skipped"] = "dry_run"
                 else:
-                    target_el, picked = await _find_prev_row(page, step)
+                    target_el, picked = await _find_prev_row(page, step, params)
+                    flat_rows = picked.pop("_flat", None)
+                    if target_el is None and picked.get("no_upcoming"):
+                        if step.fallback_days:
+                            # 已结课：改为汇总最近 N 天的作业完成情况
+                            lessons = await _fetch_lessons(page)
+                            if lessons:
+                                picked = await _scan_month_status(page, step, params, lessons, timeout)
+                            else:
+                                # VIP 1对1 等 packageCode 页面拿不到课次接口，走表格逐行点击
+                                picked = await _scan_month_status_ui(
+                                    page, step, params, flat_rows or [], timeout
+                                )
+                            entry.update(picked)
+                            variables[step.as_ or f"detail_{index}"] = picked
+                            log.append(entry)
+                            break
+                        picked["no_detail"] = True
+                        picked["message"] = f"{picked['anchor_date']} 及之后没有排课，无法确定最近一节课"
                     entry.update(picked)
                     if target_el is None:
                         # 上一次课未布置作业，直接以该结论作为流程结果，后续步骤不再执行
@@ -549,7 +585,8 @@ async def run_flow(
                         await page.wait_for_timeout(1500)
                         entry["popup_url"] = page.url
                         if step.as_:
-                            variables[step.as_] = {"url": page.url, "title": await page.title()}
+                            # 保留锚点课程信息（anchor_*），供后续步骤合并进结果
+                            variables[step.as_] = {**picked, "url": page.url, "title": await page.title()}
                     else:
                         await target_el.click(timeout=timeout)
 
@@ -600,6 +637,19 @@ async def run_flow(
                     "header": head,
                     "screenshot": shot,
                 }
+                # 合并锚点课程信息，方便人工二次确认「为什么取这一节课」
+                anchor = variables.get(step.anchor_from) if step.anchor_from else None
+                if isinstance(anchor, dict):
+                    for field in (
+                        "anchor_date",
+                        "anchor_teacher",
+                        "anchor_lesson",
+                        "anchor_time",
+                        "row_date",
+                        "cell_text",
+                    ):
+                        if anchor.get(field):
+                            result[field] = anchor[field]
                 if "未完成" in status:
                     result["message"] = f"{head}，{student} 作业未完成"
                 variables[step.as_ or f"status_{index}"] = result
@@ -655,6 +705,26 @@ async def run_flow(
                     {key: r.get(key, "") for key in ("学员姓名", "课次时间", column)}
                     for r in hits[:5]
                 ]
+
+            elif step.action == "hide":
+                # 隐藏遮挡点击的浮层（如 Copilot 气泡、公告）
+                selector = substitute(step.selector or "", params)
+                entry["target"] = selector
+                if dry_run:
+                    entry["skipped"] = "dry_run"
+                    continue
+                hidden = await page.evaluate(
+                    """(sel) => {
+                        let n = 0;
+                        document.querySelectorAll(sel).forEach((el) => {
+                            el.style.display = 'none';
+                            n += 1;
+                        });
+                        return n;
+                    }""",
+                    selector,
+                )
+                entry["hidden"] = hidden
 
             elif step.action == "sleep":
                 milliseconds = step.ms or 1000
@@ -737,11 +807,17 @@ async def _scan_row_page(page: Any, step: StepSpec) -> list[dict[str, str]]:
             const dIdx = headers.indexOf(args.date_column);
             const kIdx = headers.indexOf(args.key_column);
             const cIdx = headers.indexOf(args.click_column);
+            const lIdx = args.lesson_column ? headers.indexOf(args.lesson_column) : -1;
             if (dIdx < 0 || kIdx < 0 || cIdx < 0) return {error: '表头缺少指定的列', headers};
             return {
                 rows: rows.map((tr) => {
                     const c = Array.from(tr.querySelectorAll('td')).map(td => (td.innerText || '').trim());
-                    return {date: c[dIdx] || '', key: c[kIdx] || '', cell_text: c[cIdx] || ''};
+                    return {
+                        date: c[dIdx] || '',
+                        key: c[kIdx] || '',
+                        cell_text: c[cIdx] || '',
+                        lesson: lIdx >= 0 ? (c[lIdx] || '') : '',
+                    };
                 }),
             };
         }""",
@@ -750,12 +826,216 @@ async def _scan_row_page(page: Any, step: StepSpec) -> list[dict[str, str]]:
             "date_column": step.date_column,
             "key_column": step.key_column,
             "click_column": step.click_column,
+            "lesson_column": step.lesson_column,
         },
     )
     if result.get("error"):
         hint = f"；表头：{', '.join(result['headers'])}" if result.get("headers") else ""
         raise ToolError(f"click_prev_row 失败：{result['error']}{hint}", code="SELECTOR_NOT_FOUND")
     return result["rows"]
+
+
+async def _fetch_lessons(page: Any) -> list[dict[str, Any]]:
+    """从 IL 课次接口取整班课次（含上课时间、是否已布置作业）。"""
+    data = await page.evaluate(
+        """async () => {
+            const u = new URL(location.href);
+            const classCode = u.searchParams.get('classCode') || '';
+            const schoolId = u.searchParams.get('schoolId') || '';
+            if (!classCode) return [];
+            const url = `/plus/api/standard/admin/class/book/lessonList?schoolId=${schoolId}`
+                + `&classCode=${classCode}&pageNo=1&pageSize=300&lessonOrder=0`;
+            const body = await (await fetch(url, {credentials: 'include'})).json();
+            const d = (body && body.data) || {};
+            const list = d.list || d.records || [];
+            return list.map((it) => ({
+                date: (it.startDate || it.classBeginDate || '').slice(0, 10),
+                lesson: it.lessonNos || String(it.lessonNo || ''),
+                teacher: it.teacherName || '',
+                teacher_code: it.teacherCode || '',
+                begin: (it.sectBegin || '').slice(11, 16),
+                end: (it.sectEnd || '').slice(11, 16),
+                has_work: it.hasWork || 0,
+            }));
+        }"""
+    )
+    return [item for item in data if item.get("date")]
+
+
+async def _read_student_status(page: Any, student: str, timeout: int) -> str | None:
+    """在明细页定位学生行并读完成情况；找不到返回 None。"""
+    found: dict[str, Any] = {"missing": True}
+    for _ in range(max(1, timeout // 300)):
+        found = await page.evaluate(
+            """(name) => {
+                const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                for (const tr of document.querySelectorAll('tbody tr')) {
+                    const cell = tr.querySelector('.cell-name-left [title], .cell-name-left');
+                    if (!cell) continue;
+                    const rowName = norm(cell.getAttribute('title') || cell.textContent);
+                    if (rowName !== name) continue;
+                    const el = tr.querySelector('.status-red, .status-green, .status-gray, .status-blue');
+                    return {status: el ? norm(el.textContent) : ''};
+                }
+                return {status: '', missing: true};
+            }""",
+            student,
+        )
+        if not found.get("missing"):
+            return found["status"]
+        await page.wait_for_timeout(300)
+    return None
+
+
+async def _scan_month_status(
+    page: Any, step: StepSpec, params: dict[str, Any], lessons: list[dict[str, Any]], timeout: int
+) -> dict[str, Any]:
+    """无未来排课时：汇总该学生过去一段时间的作业完成情况。"""
+    student = str(substitute(step.value, params)) if step.value else ""
+    window = step.fallback_days or 30
+    start = (date.today() - timedelta(days=window)).isoformat()
+    candidates = sorted(
+        [x for x in lessons if x["date"] >= start], key=lambda x: x["date"], reverse=True
+    )
+    if not candidates:
+        # 近 N 天没有排课（课程更早结课）：退化为该班最近 4 节课
+        candidates = sorted(lessons, key=lambda x: x["date"], reverse=True)[:4]
+    if not candidates:
+        return {
+            "student": student,
+            "status": "无排课",
+            "no_detail": True,
+            "message": f"{start} 以来没有排课记录",
+        }
+
+    base = page.url.split("/plus/")[0]
+    query = dict(
+        part.split("=", 1) for part in page.url.split("?", 1)[-1].split("&") if "=" in part
+    )
+    class_code = query.get("classCode", "")
+    school_id = query.get("schoolId", "")
+
+    rows: list[dict[str, Any]] = []
+    shot = ""
+    for item in candidates:
+        entry = {
+            "date": item["date"],
+            "lesson": item["lesson"],
+            "teacher": item["teacher"],
+            "time": f"{item['begin']}-{item['end']}" if item["begin"] and item["end"] else "",
+        }
+        if not item.get("has_work"):
+            entry["status"] = "未布置"
+            rows.append(entry)
+            continue
+        detail = (
+            f"{base}/plus/homework/homework-result/1?classCode={class_code}&schoolId={school_id}"
+            f"&lessonType=2&lessonNo={item['lesson']}&teacherCode={item['teacher_code']}"
+            f"&startDate={item['date']}&pageType=list"
+        )
+        await page.goto(detail, wait_until="domcontentloaded", timeout=timeout)
+        await page.wait_for_timeout(1200)
+        status = await _read_student_status(page, student, min(timeout, 15000))
+        entry["status"] = status or "未知"
+        rows.append(entry)
+        shot = await _snapshot(page, student, item["date"], entry["status"])
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    summary = "、".join(f"{k} {v} 次" for k, v in counts.items())
+    return {
+        "student": student,
+        "status": "按月汇总",
+        "window_start": start,
+        "lessons": rows,
+        "screenshot": shot,
+        "message": f"{student} 近{window}天（{start} 起）共 {len(rows)} 节课：{summary}",
+    }
+
+
+async def _cell_target(page: Any, step: StepSpec, row_idx: int, cell_idx: int, text: str) -> Any:
+    """取行内目标单元格里可点击的元素（优先文本匹配的内层元素）。"""
+    cell = page.locator(step.selector).nth(row_idx).locator("td").nth(cell_idx)
+    for el in await cell.locator("a, span, div, p").all():
+        try:
+            if (await el.inner_text()).strip() == text:
+                return el
+        except Exception:  # noqa: BLE001 - 元素可能已失效
+            continue
+    return cell
+
+
+async def _scan_month_status_ui(
+    page: Any, step: StepSpec, params: dict[str, Any], flat: list[Any], timeout: int
+) -> dict[str, Any]:
+    """无课次接口时（VIP 1对1）：用表格逐行点开明细页汇总完成情况。"""
+    student = str(substitute(step.value, params)) if step.value else ""
+    window = step.fallback_days or 30
+    start = (date.today() - timedelta(days=window)).isoformat()
+    cands = [x for x in flat if x[2]["date"] and x[2]["date"] >= start]
+    if not cands:
+        # 近 N 天无课（课程更早结课）：退化为最近 4 节课
+        cands = sorted(
+            [x for x in flat if x[2]["date"]], key=lambda x: x[2]["date"], reverse=True
+        )[:4]
+    if not cands:
+        return {"student": student, "status": "无排课", "no_detail": True, "message": "没有可回看的课次"}
+
+    cands = sorted(cands, key=lambda x: x[2]["date"], reverse=True)
+    cell_idx = await _cell_index(page, step)
+    rows: list[dict[str, Any]] = []
+    shot = ""
+    current_page: int | None = None
+    for page_idx, row_idx, data in cands:
+        entry: dict[str, Any] = {
+            "date": data["date"],
+            "lesson": data.get("lesson", ""),
+            "teacher": data["key"],
+            "time": "",
+        }
+        if data["cell_text"] in ("", "--", "-"):
+            entry["status"] = "未布置"
+            rows.append(entry)
+            continue
+        if current_page != page_idx:
+            await _goto_page(page, page_idx)
+            current_page = page_idx
+        target = await _cell_target(page, step, row_idx, cell_idx, data["cell_text"])
+        async with page.context.expect_page(timeout=max(timeout, 10_000)) as pinfo:
+            await target.click(timeout=timeout)
+        detail = await pinfo.value
+        await detail.wait_for_load_state("domcontentloaded", timeout=timeout)
+        await detail.wait_for_timeout(1200)
+        status = await _read_student_status(detail, student, min(timeout, 15_000)) or "未知"
+        entry["status"] = status
+        # 明细页头部带上课时间（如 13:20-15:20;15:40-17:40），从文本里取
+        try:
+            head_text = re.sub(
+                r"\s+", " ", await detail.locator(".part-left p").first.inner_text()
+            ).strip()
+        except Exception:  # noqa: BLE001 - 头部结构变化时不影响主流程
+            head_text = ""
+        time_match = re.search(
+            r"\d{1,2}:\d{2}-\d{1,2}:\d{2}(?:;\d{1,2}:\d{2}-\d{1,2}:\d{2})*", head_text
+        )
+        entry["time"] = time_match.group(0) if time_match else ""
+        rows.append(entry)
+        shot = await _snapshot(detail, student, data["date"], status)
+        await detail.close()
+
+    counts: dict[str, int] = {}
+    for item in rows:
+        counts[item["status"]] = counts.get(item["status"], 0) + 1
+    summary = "、".join(f"{k} {v} 次" for k, v in counts.items())
+    return {
+        "student": student,
+        "status": "按月汇总",
+        "window_start": start,
+        "lessons": rows,
+        "screenshot": shot,
+        "message": f"{student} 近{window}天共 {len(rows)} 节课：{summary}",
+    }
 
 
 async def _goto_page(page: Any, index: int) -> None:
@@ -860,7 +1140,7 @@ async def _replay_filters(page: Any, spec: FlowSpec, params: dict[str, Any]) -> 
     await page.wait_for_timeout(800)
 
 
-async def _find_prev_row(page: Any, step: StepSpec) -> tuple[Any, dict[str, Any]]:
+async def _find_prev_row(page: Any, step: StepSpec, params: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     """找「今天 + offset_days」之后最近的一节课，取该行 key 列的值，再定位同一 key 更早的最近一行。
 
     表格有分页时会在各页之间移动，最终回到目标行所在页并返回可点击元素。
@@ -893,9 +1173,23 @@ async def _find_prev_row(page: Any, step: StepSpec) -> tuple[Any, dict[str, Any]
 
     upcoming = [item for item in flat if item[2]["date"] and item[2]["date"] >= anchor]
     if not upcoming:
-        raise ToolError(f"click_prev_row 失败：{anchor} 及之后没有排课", code="SELECTOR_NOT_FOUND")
+        # 没有未来排课（如已结课）：交给上层决定是否回看历史
+        return None, {"anchor_date": anchor, "no_upcoming": True, "status": "无排课", "_flat": flat}
     _, _, anchor_data = min(upcoming, key=lambda x: (x[2]["date"], x[0], x[1]))
     key = anchor_data["key"]
+
+    # 锚点课的上课时间：优先取课次接口里的 sectBegin/sectEnd
+    lessons = await _fetch_lessons(page)
+    anchor_lesson = anchor_data.get("lesson", "")
+    anchor_time = ""
+    for item in lessons:
+        if item["date"] != anchor_data["date"]:
+            continue
+        if anchor_lesson and item["lesson"].replace(",", "、") != anchor_lesson:
+            continue
+        if item["begin"] and item["end"]:
+            anchor_time = f"{item['begin']}-{item['end']}"
+        break
 
     earlier = [
         item
@@ -918,6 +1212,9 @@ async def _find_prev_row(page: Any, step: StepSpec) -> tuple[Any, dict[str, Any]
         shot = await _snapshot(page, student, target_data["date"], "未布置")
         picked = {
             "anchor_date": anchor_data["date"],
+            "anchor_teacher": key,
+            "anchor_lesson": anchor_data.get("lesson", ""),
+            "anchor_time": anchor_time,
             "key": key,
             "row_date": target_data["date"],
             "cell_text": cell_text or "--",
@@ -938,6 +1235,9 @@ async def _find_prev_row(page: Any, step: StepSpec) -> tuple[Any, dict[str, Any]
 
     picked = {
         "anchor_date": anchor_data["date"],
+        "anchor_teacher": key,
+        "anchor_lesson": anchor_data.get("lesson", ""),
+        "anchor_time": anchor_time,
         "key": key,
         "row_date": target_data["date"],
         "cell_text": cell_text,
