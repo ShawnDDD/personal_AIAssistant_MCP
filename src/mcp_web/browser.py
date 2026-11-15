@@ -26,7 +26,13 @@ class BrowserManager:
         from playwright.async_api import async_playwright
 
         settings = get_settings()
-        wanted = settings.web_headless if headless is None else headless
+        if headless is None:
+            # 没显式指定时，已经在跑的浏览器保持当前模式；
+            # 否则 context()/page() 会把流程刚设好的无头模式又切回配置里的有头模式，
+            # 每次都重建浏览器和登录上下文（一次约 20 秒）。
+            wanted = self.headless if self._browser is not None else settings.web_headless
+        else:
+            wanted = headless
 
         if self._browser is not None and self.headless == wanted:
             return
