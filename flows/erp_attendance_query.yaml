@@ -48,6 +48,18 @@ steps:
     selector: 'input[placeholder="请输入学管"]'
     value: "{{ manager }}"
 
+  # 只看未打卡：把「学员考勤状态」下拉选成未打卡，缩小结果集
+  # 注意：Element UI 的浮层会挂到 body 上，所以选项要在可见的 .el-select-dropdown 里找
+  - action: click
+    selector: '.el-form-item:has(.el-form-item__label:text-is("学员考勤状态：")) .el-select'
+
+  - action: wait_for
+    selector: '.el-select-dropdown:visible li.el-select-dropdown__item span:text-is("未打卡")'
+    timeout_ms: 10000
+
+  - action: click
+    selector: '.el-select-dropdown:visible li.el-select-dropdown__item span:text-is("未打卡")'
+
   # 用 button 限定，避免误点左侧菜单「考勤查询」
   - action: click
     selector: 'button:has-text("查询")'
@@ -64,12 +76,11 @@ steps:
     scroll_times: 12
     as: rows
 
-  # 查询结果留一张截图（表格是虚拟滚动，先归零滚动再截当前视口）
-  - action: screenshot
-    path: "data/screenshots/一对一打卡_{{ start_date }}_{{ end_date }}.png"
-    full_page: false
-    reset_scroll: '.ag-root .ag-center-cols-viewport, .ag-root .ag-body-viewport, .ag-root .ag-body-horizontal-scroll-viewport'
-    as: screenshot
+  # 有未打卡记录时，切到可见浏览器重放筛选条件并保持打开，等待人工处理
+  - action: reveal_on_match
+    from: rows
+    match_column: 学员打卡状态
+    match_value: 未打卡
 
 # 学管条件已由服务端 manager 参数过滤，这里直接输出
 output:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -65,7 +65,7 @@ class StepSpec(BaseModel):
         "click_prev_row",
         "student_status",
         "wait_ready",
-        "screenshot",
+        "reveal_on_match",
     ]
     url: str | None = None
     selector: str | None = None
@@ -92,11 +92,10 @@ class StepSpec(BaseModel):
     scroll_selector: str | None = None
     max_pages: int | None = None
     scroll_times: int | None = None
-    # screenshot 用：保存路径（支持 {{ param }}，相对项目根目录）；full_page 控制整页还是当前视口
-    path: str | None = None
-    full_page: bool = True
-    # 截图前把匹配元素的滚动位置归零，避免截到滚动到一半的空表格
-    reset_scroll: str | None = None
+    # reveal_on_match 用：数据来源变量、判断列、命中后弹出有头浏览器的触发值
+    from_var: str | None = Field(default=None, alias="from")
+    match_column: str | None = None
+    match_value: str | None = None
 
 
 class PaginateSpec(BaseModel):
@@ -358,6 +357,7 @@ async def run_flow(
     log: list[dict] = []
     warnings: list[str] = []
     index = 0
+    keep_open = False
 
     try:
         for index, step in enumerate(spec.steps, start=1):
@@ -623,34 +623,38 @@ async def run_flow(
                     pass
                 entry["settled"] = True
 
-            elif step.action == "screenshot":
-                entry["target"] = "page"
+            elif step.action == "reveal_on_match":
+                # 命中指定条件时，关掉无头浏览器，用有头浏览器重放筛选条件并保持打开
+                rows = variables.get(step.from_var or "")
+                column = substitute(step.match_column or "", params)
+                wanted = substitute(step.match_value or "", params)
+                entry["column"] = column
+                if not isinstance(rows, list):
+                    raise ToolError(
+                        f"第 {index} 步 reveal_on_match 找不到数据变量：{step.from_var}",
+                        code="FLOW_INVALID",
+                    )
+                hits = [r for r in rows if isinstance(r, dict) and str(r.get(column, "")).strip() == wanted]
+                entry["matched"] = len(hits)
                 if dry_run:
                     entry["skipped"] = "dry_run"
                     continue
-                root = Path(__file__).resolve().parents[2]
-                if step.path:
-                    shot = Path(substitute(step.path, params)).expanduser()
-                    if not shot.is_absolute():
-                        shot = root / shot
-                else:
-                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    shot = root / "data" / "screenshots" / f"{spec.name}_{stamp}.png"
-                shot.parent.mkdir(parents=True, exist_ok=True)
-                if step.reset_scroll:
-                    await page.evaluate(
-                        """(sel) => {
-                            document.querySelectorAll(sel).forEach((el) => {
-                                el.scrollLeft = 0;
-                                el.scrollTop = 0;
-                            });
-                        }""",
-                        substitute(step.reset_scroll, params),
-                    )
-                    await page.wait_for_timeout(800)
-                await page.screenshot(path=str(shot), full_page=step.full_page)
-                entry["path"] = str(shot)
-                variables[step.as_ or "screenshot"] = str(shot)
+                if not hits:
+                    continue
+
+                await manager.close()
+                await manager.start(False)
+                page = await manager.page(spec.site)
+                window_id = await _hide_window(page)
+                await _replay_filters(page, spec, params)
+                await _show_window(page, window_id)
+                keep_open = True
+                entry["revealed"] = True
+                entry["url"] = page.url
+                entry["sample"] = [
+                    {key: r.get(key, "") for key in ("学员姓名", "课次时间", column)}
+                    for r in hits[:5]
+                ]
 
             elif step.action == "sleep":
                 milliseconds = step.ms or 1000
@@ -705,6 +709,7 @@ async def run_flow(
         "page_count": page_count,
         "truncated": truncated,
         "mode": spec.mode,
+        "keep_open": keep_open,
     }
 
 
@@ -775,6 +780,84 @@ async def _snapshot(page: Any, student: str, day: str, status: str) -> str:
     shot.parent.mkdir(parents=True, exist_ok=True)
     await page.screenshot(path=str(shot), full_page=True)
     return str(shot)
+
+
+async def _hide_window(page: Any) -> int | None:
+    """把有头浏览器窗口挪到屏幕外，让重放筛选的过程不可见。返回 windowId。"""
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        info = await cdp.send("Browser.getWindowForTarget")
+        window_id = info["windowId"]
+        # 先取消最大化，否则设置坐标无效
+        await cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"windowState": "normal"}})
+        await cdp.send(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": {"left": -3200, "top": 0, "width": 1680, "height": 1000}},
+        )
+        return window_id
+    except Exception:  # noqa: BLE001 - 窗口控制失败不影响查询
+        return None
+
+
+async def _show_window(page: Any, window_id: int | None) -> None:
+    """把窗口移回屏内并最大化，留给人工操作。"""
+    if window_id is not None:
+        try:
+            cdp = await page.context.new_cdp_session(page)
+            await cdp.send(
+                "Browser.setWindowBounds",
+                {"windowId": window_id, "bounds": {"left": 0, "top": 0, "width": 1680, "height": 1000}},
+            )
+            await cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {"windowState": "maximized"}})
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await page.bring_to_front()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _replay_filters(page: Any, spec: FlowSpec, params: dict[str, Any]) -> None:
+    """在有头浏览器里重放「填筛选条件 → 查询」这一段，用于把结果页展示给人看。
+
+    只重放到第一次数据抓取（paginate_grid / click_prev_row）之前，避免重复抓一遍数据。
+    """
+    base_url = substitute(spec.base_url, params)
+    timeout = get_settings().web_timeout_ms
+    for step in spec.steps:
+        if step.action in ("paginate_grid", "click_prev_row", "student_status", "reveal_on_match"):
+            break
+        if step.action == "goto":
+            await page.goto(_absolute_url(base_url, substitute(step.url or "", params)), wait_until="domcontentloaded")
+        elif step.action == "wait_for" and step.selector:
+            await page.wait_for_selector(substitute(step.selector, params), state="visible", timeout=step.timeout_ms or timeout)
+        elif step.action == "set_datetime":
+            await set_datetime(
+                page,
+                substitute(step.selector or "", params),
+                step.index or 0,
+                substitute(step.value, params),
+                step.timeout_ms or timeout,
+            )
+        elif step.action == "fill":
+            await page.fill(
+                substitute(step.selector or "", params),
+                substitute(step.value, params),
+                timeout=step.timeout_ms or timeout,
+            )
+        elif step.action == "click":
+            await page.click(substitute(step.selector or "", params), timeout=step.timeout_ms or timeout)
+        elif step.action == "wait_ready":
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:  # noqa: BLE001 - 轮询型页面可能长期不 idle
+                pass
+    # 说明：重放时故意跳过 sleep 步骤，用接口静默代替固定等待
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:  # noqa: BLE001 - 轮询型页面可能长期不 idle
+        pass
+    await page.wait_for_timeout(800)
 
 
 async def _find_prev_row(page: Any, step: StepSpec) -> tuple[Any, dict[str, Any]]:
