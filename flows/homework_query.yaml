@@ -19,6 +19,12 @@ params:
     type: str
     required: false
     default: "{{ env.TALKWEB_MANAGER }}"
+  # 回看天数：传了正整数时改为汇总最近 N 天的全部课程；
+  # 不传（0）时仍按默认逻辑取「未来最近一节课 + 该老师上一次课」
+  - name: days
+    type: int
+    required: false
+    default: 0
 
 steps:
   - action: goto
@@ -125,6 +131,8 @@ steps:
     offset_days: 1
     # 已结课（没有未来排课）时，改为汇总最近 30 天的作业完成情况
     fallback_days: 30
+    # 传了 days 参数时，强制按该天数汇总全部课程
+    window_param: days
     next_selector: '.el-pagination .btn-next'
     max_pages: 20
     expect_popup: true

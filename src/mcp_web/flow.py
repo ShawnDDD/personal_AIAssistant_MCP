@@ -102,6 +102,8 @@ class StepSpec(BaseModel):
     anchor_from: str | None = None
     # click_prev_row 用：没有未来排课时，回看最近 N 天的作业完成情况（0 表示不回看）
     fallback_days: int = 0
+    # click_prev_row 用：流程参数名，取到正整数时强制汇总最近 N 天的全部课程
+    window_param: str | None = None
     # reveal_on_match 用：数据来源变量、判断列、命中后弹出有头浏览器的触发值
     from_var: str | None = Field(default=None, alias="from")
     match_column: str | None = None
@@ -574,6 +576,25 @@ async def run_flow(
                 if dry_run:
                     entry["skipped"] = "dry_run"
                 else:
+                    # 指定了回看天数时，直接汇总最近 N 天的全部课程，不看未来排课
+                    forced_days = _resolve_window_days(step, params)
+                    if forced_days:
+                        lessons = await _fetch_lessons(page)
+                        if lessons:
+                            picked = await _scan_month_status(
+                                page, step, params, lessons, timeout, forced_days
+                            )
+                        else:
+                            # VIP 1对1 等 packageCode 页面拿不到课次接口，走表格逐行点击
+                            picked = await _scan_month_status_ui(
+                                page, step, params, await _scan_all_rows(page, step), timeout, forced_days
+                            )
+                        entry.update(picked)
+                        variables[step.as_ or f"detail_{index}"] = picked
+                        entry["ms"] = int((time.perf_counter() - started) * 1000)
+                        log.append(entry)
+                        break
+
                     target_el, picked = await _find_prev_row(page, step, params)
                     flat_rows = picked.pop("_flat", None)
                     if target_el is None and picked.get("no_upcoming"):
@@ -581,11 +602,12 @@ async def run_flow(
                             # 已结课：改为汇总最近 N 天的作业完成情况
                             lessons = await _fetch_lessons(page)
                             if lessons:
-                                picked = await _scan_month_status(page, step, params, lessons, timeout)
+                                picked = await _scan_month_status(
+                                    page, step, params, lessons, timeout, int(step.fallback_days)
+                                )
                             else:
-                                # VIP 1对1 等 packageCode 页面拿不到课次接口，走表格逐行点击
                                 picked = await _scan_month_status_ui(
-                                    page, step, params, flat_rows or [], timeout
+                                    page, step, params, flat_rows or [], timeout, int(step.fallback_days)
                                 )
                             entry.update(picked)
                             variables[step.as_ or f"detail_{index}"] = picked
@@ -931,18 +953,26 @@ async def _read_student_status(page: Any, student: str, timeout: int) -> str | N
 
 
 async def _scan_month_status(
-    page: Any, step: StepSpec, params: dict[str, Any], lessons: list[dict[str, Any]], timeout: int
+    page: Any,
+    step: StepSpec,
+    params: dict[str, Any],
+    lessons: list[dict[str, Any]],
+    timeout: int,
+    window: int,
 ) -> dict[str, Any]:
     """无未来排课时：汇总该学生过去一段时间的作业完成情况。"""
     student = str(substitute(step.value, params)) if step.value else ""
-    window = step.fallback_days or 30
     start = (date.today() - timedelta(days=window)).isoformat()
+    today = date.today().isoformat()
+    # 只看已经上过的课，未来的排课不参与汇总
     candidates = sorted(
-        [x for x in lessons if x["date"] >= start], key=lambda x: x["date"], reverse=True
+        [x for x in lessons if start <= x["date"] <= today], key=lambda x: x["date"], reverse=True
     )
     if not candidates:
-        # 近 N 天没有排课（课程更早结课）：退化为该班最近 4 节课
-        candidates = sorted(lessons, key=lambda x: x["date"], reverse=True)[:4]
+        # 近 N 天没有排课（课程更早结课）：退化为该班最近 4 节已上过的课
+        candidates = sorted(
+            [x for x in lessons if x["date"] <= today], key=lambda x: x["date"], reverse=True
+        )[:4]
     if not candidates:
         return {
             "student": student,
@@ -1009,17 +1039,25 @@ async def _cell_target(page: Any, step: StepSpec, row_idx: int, cell_idx: int, t
 
 
 async def _scan_month_status_ui(
-    page: Any, step: StepSpec, params: dict[str, Any], flat: list[Any], timeout: int
+    page: Any,
+    step: StepSpec,
+    params: dict[str, Any],
+    flat: list[Any],
+    timeout: int,
+    window: int,
 ) -> dict[str, Any]:
     """无课次接口时（VIP 1对1）：用表格逐行点开明细页汇总完成情况。"""
     student = str(substitute(step.value, params)) if step.value else ""
-    window = step.fallback_days or 30
     start = (date.today() - timedelta(days=window)).isoformat()
-    cands = [x for x in flat if x[2]["date"] and x[2]["date"] >= start]
+    today = date.today().isoformat()
+    # 只看已经上过的课，未来的排课不参与汇总
+    cands = [x for x in flat if x[2]["date"] and start <= x[2]["date"] <= today]
     if not cands:
-        # 近 N 天无课（课程更早结课）：退化为最近 4 节课
+        # 近 N 天无课（课程更早结课）：退化为最近 4 节已上过的课
         cands = sorted(
-            [x for x in flat if x[2]["date"]], key=lambda x: x[2]["date"], reverse=True
+            [x for x in flat if x[2]["date"] and x[2]["date"] <= today],
+            key=lambda x: x[2]["date"],
+            reverse=True,
         )[:4]
     if not cands:
         return {"student": student, "status": "无排课", "no_detail": True, "message": "没有可回看的课次"}
@@ -1230,6 +1268,46 @@ async def _replay_filters(page: Any, spec: FlowSpec, params: dict[str, Any]) -> 
     await page.wait_for_timeout(800)
 
 
+async def _scan_all_rows(page: Any, step: StepSpec) -> list[tuple[int, int, dict[str, str]]]:
+    """逐页读取整张表，返回 (页序号, 行序号, 行数据)。"""
+    collected: list[list[dict[str, str]]] = []
+    max_pages = max(1, step.max_pages or 20)
+    for _ in range(max_pages):
+        collected.append(await _scan_row_page(page, step))
+        if not step.next_selector:
+            break
+        nxt = page.locator(step.next_selector).first
+        if await nxt.count() == 0:
+            break
+        if await nxt.get_attribute("disabled") is not None:
+            break
+        if "disabled" in (await nxt.get_attribute("class") or ""):
+            break
+        signature = await _rows_signature(page, step.selector)
+        active = await _active_page(page)
+        await nxt.click()
+        await _wait_paging(page, step.selector, signature, active)
+    return [
+        (page_index, row_index, row)
+        for page_index, rows in enumerate(collected)
+        for row_index, row in enumerate(rows)
+    ]
+
+
+def _resolve_window_days(step: StepSpec, params: dict[str, Any]) -> int:
+    """取流程参数里的回看天数；未传或为空时返回 0，走默认的锚点课逻辑。"""
+    if not step.window_param:
+        return 0
+    raw = params.get(step.window_param)
+    if raw is None or str(raw).strip() == "":
+        return 0
+    try:
+        days = int(str(raw).strip())
+    except ValueError as exc:
+        raise ToolError(f"回看天数需要整数，收到：{raw}", code="FLOW_INVALID") from exc
+    return max(0, days)
+
+
 async def _find_prev_row(page: Any, step: StepSpec, params: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     """找「今天 + offset_days」之后最近的一节课，取该行 key 列的值，再定位同一 key 更早的最近一行。
 
@@ -1258,29 +1336,7 @@ async def _find_prev_row(page: Any, step: StepSpec, params: dict[str, Any]) -> t
             return await _pick_target(page, step, params, cell, cell_text, picked)
 
     # 兜底：接口没有数据或表格与接口对不上时，按表格逐页扫描
-    collected: list[list[dict[str, str]]] = []
-    max_pages = max(1, step.max_pages or 20)
-    for _ in range(max_pages):
-        collected.append(await _scan_row_page(page, step))
-        if not step.next_selector:
-            break
-        nxt = page.locator(step.next_selector).first
-        if await nxt.count() == 0:
-            break
-        if await nxt.get_attribute("disabled") is not None:
-            break
-        if "disabled" in (await nxt.get_attribute("class") or ""):
-            break
-        signature = await _rows_signature(page, step.selector)
-        active = await _active_page(page)
-        await nxt.click()
-        await _wait_paging(page, step.selector, signature, active)
-
-    flat = [
-        (page_index, row_index, row)
-        for page_index, rows in enumerate(collected)
-        for row_index, row in enumerate(rows)
-    ]
+    flat = await _scan_all_rows(page, step)
     if not flat:
         raise ToolError("click_prev_row 失败：表格没有数据行", code="SELECTOR_NOT_FOUND")
 
@@ -1312,8 +1368,9 @@ async def _find_prev_row(page: Any, step: StepSpec, params: dict[str, Any]) -> t
     if not earlier:
         raise ToolError(f"click_prev_row 失败：{key} 在该日期之前没有更早的记录", code="SELECTOR_NOT_FOUND")
     target_page, target_row, target_data = max(earlier, key=lambda x: (x[2]["date"], x[0], x[1]))
+    page_count = flat[-1][0] + 1
 
-    if target_page != len(collected) - 1:
+    if target_page != page_count - 1:
         await _goto_page(page, target_page)
 
     row = page.locator(step.selector).nth(target_row)
@@ -1328,7 +1385,7 @@ async def _find_prev_row(page: Any, step: StepSpec, params: dict[str, Any]) -> t
         "key": key,
         "row_date": target_data["date"],
         "cell_text": target_data["cell_text"],
-        "pages": len(collected),
+        "pages": page_count,
         "row_index": target_row,
     }
     return await _pick_target(page, step, params, cell, target_data["cell_text"], picked)

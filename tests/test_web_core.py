@@ -13,7 +13,9 @@ from mcp_web.browser import BrowserManager
 from mcp_web.flow import (
     FlowSpec,
     ParamSpec,
+    StepSpec,
     _plan_from_lessons,
+    _resolve_window_days,
     load_flow,
     resolve_params,
     substitute,
@@ -81,6 +83,25 @@ def test_plan_from_lessons_without_upcoming_returns_none():
 def test_plan_from_lessons_without_earlier_lesson_returns_none():
     lessons = [{"date": "2026-11-22", "lesson": "27", "teacher": "王侠栋", "begin": "", "end": ""}]
     assert _plan_from_lessons(lessons, "2026-11-16") is None
+
+
+def test_resolve_window_days_reads_param():
+    step = StepSpec(action="click_prev_row", window_param="days")
+    assert _resolve_window_days(step, {"days": 180}) == 180
+    assert _resolve_window_days(step, {"days": "90"}) == 90
+    assert _resolve_window_days(step, {"days": 0}) == 0
+    assert _resolve_window_days(step, {}) == 0
+
+
+def test_resolve_window_days_without_window_param():
+    assert _resolve_window_days(StepSpec(action="click_prev_row"), {"days": 180}) == 0
+
+
+def test_resolve_window_days_rejects_non_number():
+    step = StepSpec(action="click_prev_row", window_param="days")
+    with pytest.raises(ToolError) as excinfo:
+        _resolve_window_days(step, {"days": "半年"})
+    assert excinfo.value.code == "FLOW_INVALID"
 
 
 def test_flow_rejects_unknown_action(tmp_path):
