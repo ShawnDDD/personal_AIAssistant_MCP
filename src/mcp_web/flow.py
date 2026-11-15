@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -105,6 +106,10 @@ class StepSpec(BaseModel):
     from_var: str | None = Field(default=None, alias="from")
     match_column: str | None = None
     match_value: str | None = None
+    # goto 用：同一地址重复执行时强制刷新，避免单页应用保留上一次的筛选状态和旧表格
+    reload: bool = False
+    # assert 用：自定义失败提示，便于定位是哪一类校验没过
+    message: str | None = None
 
 
 class PaginateSpec(BaseModel):
@@ -362,6 +367,7 @@ async def run_flow(
     if spec.headless is not None:
         await manager.start(spec.headless)
     page = await manager.page(spec.site)
+    main_page = page
     variables: dict[str, Any] = {}
     log: list[dict] = []
     warnings: list[str] = []
@@ -371,6 +377,7 @@ async def run_flow(
     try:
         for index, step in enumerate(spec.steps, start=1):
             entry: dict[str, Any] = {"step": index, "action": step.action}
+            started = time.perf_counter()
             timeout = step.timeout_ms or settings.web_timeout_ms
 
             if step.action == "goto":
@@ -378,7 +385,24 @@ async def run_flow(
                 if not url:
                     raise ToolError(f"第 {index} 步 goto 缺少 url", code="FLOW_INVALID")
                 entry["url"] = _absolute_url(substitute(spec.base_url, params), url)
+                if step.reload:
+                    # 单页应用里跳到相同地址不会真正加载，表单和旧表格会留在页面上，
+                    # 批量连续执行时可能点到上一次查询的结果，这里按需强制刷新一次。
+                    try:
+                        await page.evaluate("() => { window.__flow_reload_mark = 1; }")
+                    except Exception:  # noqa: BLE001 - 空白页不支持执行脚本
+                        pass
                 await page.goto(entry["url"], wait_until="domcontentloaded")
+                if step.reload:
+                    try:
+                        same_document = await page.evaluate(
+                            "() => window.__flow_reload_mark === 1"
+                        )
+                    except Exception:  # noqa: BLE001
+                        same_document = False
+                    if same_document:
+                        await page.reload(wait_until="domcontentloaded")
+                        entry["reloaded"] = True
 
             elif step.action == "fill":
                 if step.value is None:
@@ -419,9 +443,9 @@ async def run_flow(
                         lambda r: step.expect_response in r.url, timeout=timeout
                     ) as resp_info:
                         await locator.first.click(timeout=timeout)
-                    await page.wait_for_timeout(600)
                     response = await resp_info.value
                     entry["response"] = response.url
+                    await page.wait_for_timeout(300)
                 else:
                     await locator.first.click(timeout=timeout)
 
@@ -565,6 +589,7 @@ async def run_flow(
                                 )
                             entry.update(picked)
                             variables[step.as_ or f"detail_{index}"] = picked
+                            entry["ms"] = int((time.perf_counter() - started) * 1000)
                             log.append(entry)
                             break
                         picked["no_detail"] = True
@@ -573,6 +598,7 @@ async def run_flow(
                     if target_el is None:
                         # 上一次课未布置作业，直接以该结论作为流程结果，后续步骤不再执行
                         variables[step.as_ or f"detail_{index}"] = picked
+                        entry["ms"] = int((time.perf_counter() - started) * 1000)
                         log.append(entry)
                         break
                     if step.expect_popup:
@@ -582,7 +608,6 @@ async def run_flow(
                             await target_el.click(timeout=timeout)
                         page = await page_info.value
                         await page.wait_for_load_state("domcontentloaded", timeout=timeout)
-                        await page.wait_for_timeout(1500)
                         entry["popup_url"] = page.url
                         if step.as_:
                             # 保留锚点课程信息（anchor_*），供后续步骤合并进结果
@@ -641,6 +666,7 @@ async def run_flow(
                 anchor = variables.get(step.anchor_from) if step.anchor_from else None
                 if isinstance(anchor, dict):
                     for field in (
+                        "anchor",
                         "anchor_date",
                         "anchor_teacher",
                         "anchor_lesson",
@@ -739,12 +765,21 @@ async def run_flow(
                     substitute(step.selector, params) if step.selector else None,
                     substitute(step.text, params) if step.text else None,
                 )
-                if await locator.count() == 0:
-                    raise ToolError(
-                        f"第 {index} 步断言失败，元素不存在：{step.selector or step.text or step.ref}",
-                        code="SELECTOR_NOT_FOUND",
+                entry["target"] = step.text or step.selector or f"ref={step.ref}"
+                try:
+                    # 页面数据是异步渲染的，断言要给一个等待窗口，元素出现即通过
+                    await locator.first.wait_for(
+                        state="attached", timeout=step.timeout_ms or 5000
                     )
+                except Exception as exc:  # noqa: BLE001 - 断言失败统一翻译成可操作错误
+                    custom = substitute(step.message, params) if step.message else ""
+                    raise ToolError(
+                        custom
+                        or f"第 {index} 步断言失败，元素不存在：{step.selector or step.text or step.ref}",
+                        code="SELECTOR_NOT_FOUND",
+                    ) from exc
 
+            entry["ms"] = int((time.perf_counter() - started) * 1000)
             log.append(entry)
 
         paginated = await _paginate(page, spec, params, dry_run)
@@ -757,6 +792,14 @@ async def run_flow(
         if run_dir is not None:
             await _save_failure(page, run_dir, index)
         raise ToolError(f"流程执行失败：{exc}", code="BROWSER_ERROR") from exc
+    finally:
+        # 明细页是点击后新开的标签，读完即关，避免批量查询时标签越积越多
+        if not keep_open and page is not main_page:
+            try:
+                if not page.is_closed():
+                    await page.close()
+            except Exception:  # noqa: BLE001 - 关闭失败不影响结果
+                pass
 
     if paginated is not None:
         data: Any = paginated["rows"]
@@ -934,7 +977,6 @@ async def _scan_month_status(
             f"&startDate={item['date']}&pageType=list"
         )
         await page.goto(detail, wait_until="domcontentloaded", timeout=timeout)
-        await page.wait_for_timeout(1200)
         status = await _read_student_status(page, student, min(timeout, 15000))
         entry["status"] = status or "未知"
         rows.append(entry)
@@ -1006,7 +1048,6 @@ async def _scan_month_status_ui(
             await target.click(timeout=timeout)
         detail = await pinfo.value
         await detail.wait_for_load_state("domcontentloaded", timeout=timeout)
-        await detail.wait_for_timeout(1200)
         status = await _read_student_status(detail, student, min(timeout, 15_000)) or "未知"
         entry["status"] = status
         # 明细页头部带上课时间（如 13:20-15:20;15:40-17:40），从文本里取
@@ -1038,19 +1079,68 @@ async def _scan_month_status_ui(
     }
 
 
+async def _rows_signature(page: Any, selector: str) -> str:
+    """取首行文本作为「当前页数据」的指纹，用来判断翻页后数据是否已刷新。"""
+    return await page.evaluate(
+        """(sel) => {
+            const tr = document.querySelector(sel);
+            return tr ? (tr.innerText || '').replace(/\\s+/g, ' ').slice(0, 120) : '';
+        }""",
+        selector,
+    )
+
+
+async def _active_page(page: Any) -> str:
+    """取分页器当前页码文本，没有分页器时返回空串。"""
+    return await page.evaluate(
+        """() => {
+            const el = document.querySelector('.el-pager li.is-active');
+            return el ? (el.innerText || '').trim() : '';
+        }"""
+    )
+
+
+async def _wait_paging(
+    page: Any,
+    selector: str,
+    before_signature: str,
+    before_active: str,
+    timeout: int = 3000,
+) -> None:
+    """等翻页真正生效：优先看页码变化，没有分页器时看首行文本变化。
+
+    替代固定 1200ms 等待，数据到得快时立即返回。
+    """
+    waited = 0
+    while waited < timeout:
+        if before_active:
+            if await _active_page(page) not in ("", before_active):
+                return
+        else:
+            current = await _rows_signature(page, selector)
+            if current and current != before_signature:
+                return
+        await page.wait_for_timeout(120)
+        waited += 120
+
+
 async def _goto_page(page: Any, index: int) -> None:
     """切到第 index 页（0 基），优先点页码，退化时用上一页按钮回退。"""
     pager = page.locator(".el-pager li.number")
     if await pager.count() > index:
+        signature = await _rows_signature(page, "tbody tr")
+        active = await _active_page(page)
         await pager.nth(index).click()
-        await page.wait_for_timeout(1200)
+        await _wait_paging(page, "tbody tr", signature, active)
         return
     prev = page.locator(".btn-prev")
     for _ in range(30):
         if await prev.count() == 0 or await prev.get_attribute("disabled") is not None:
             break
+        signature = await _rows_signature(page, "tbody tr")
+        active = await _active_page(page)
         await prev.first.click()
-        await page.wait_for_timeout(900)
+        await _wait_paging(page, "tbody tr", signature, active)
 
 
 async def _snapshot(page: Any, student: str, day: str, status: str) -> str:
@@ -1143,10 +1233,31 @@ async def _replay_filters(page: Any, spec: FlowSpec, params: dict[str, Any]) -> 
 async def _find_prev_row(page: Any, step: StepSpec, params: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     """找「今天 + offset_days」之后最近的一节课，取该行 key 列的值，再定位同一 key 更早的最近一行。
 
-    表格有分页时会在各页之间移动，最终回到目标行所在页并返回可点击元素。
+    优先用课次接口算出锚点课与目标课，再翻页定位到目标行（找到即停）；
+    接口不可用（如 VIP 1对1 的 packageCode 页面）时退回逐页扫描。
     """
     anchor = (date.today() + timedelta(days=step.offset_days)).isoformat()
 
+    lessons = await _fetch_lessons(page)
+    plan = _plan_from_lessons(lessons, anchor)
+    if plan is not None:
+        located = await _locate_row(page, step, plan["row_date"], plan["anchor_teacher"])
+        if located is not None:
+            cell, cell_text, row_index = located
+            picked = {
+                "anchor": f"{plan['anchor_teacher']}｜{plan['anchor_date']}",
+                "anchor_date": plan["anchor_date"],
+                "anchor_teacher": plan["anchor_teacher"],
+                "anchor_lesson": plan["anchor_lesson"],
+                "anchor_time": plan["anchor_time"],
+                "key": plan["anchor_teacher"],
+                "row_date": plan["row_date"],
+                "cell_text": cell_text,
+                "row_index": row_index,
+            }
+            return await _pick_target(page, step, params, cell, cell_text, picked)
+
+    # 兜底：接口没有数据或表格与接口对不上时，按表格逐页扫描
     collected: list[list[dict[str, str]]] = []
     max_pages = max(1, step.max_pages or 20)
     for _ in range(max_pages):
@@ -1160,8 +1271,10 @@ async def _find_prev_row(page: Any, step: StepSpec, params: dict[str, Any]) -> t
             break
         if "disabled" in (await nxt.get_attribute("class") or ""):
             break
+        signature = await _rows_signature(page, step.selector)
+        active = await _active_page(page)
         await nxt.click()
-        await page.wait_for_timeout(1200)
+        await _wait_paging(page, step.selector, signature, active)
 
     flat = [
         (page_index, row_index, row)
@@ -1206,24 +1319,102 @@ async def _find_prev_row(page: Any, step: StepSpec, params: dict[str, Any]) -> t
     row = page.locator(step.selector).nth(target_row)
     cell_index = await _cell_index(page, step)
     cell = row.locator("td").nth(cell_index)
-    cell_text = target_data["cell_text"]
+    picked = {
+        "anchor": f"{key}｜{anchor_data['date']}",
+        "anchor_date": anchor_data["date"],
+        "anchor_teacher": key,
+        "anchor_lesson": anchor_data.get("lesson", ""),
+        "anchor_time": anchor_time,
+        "key": key,
+        "row_date": target_data["date"],
+        "cell_text": target_data["cell_text"],
+        "pages": len(collected),
+        "row_index": target_row,
+    }
+    return await _pick_target(page, step, params, cell, target_data["cell_text"], picked)
+
+
+def _plan_from_lessons(lessons: list[dict[str, Any]], anchor: str) -> dict[str, Any] | None:
+    """用课次接口数据算出锚点课与「同老师上一次课」。"""
+    upcoming = [item for item in lessons if item.get("date") and item["date"] >= anchor]
+    if not upcoming:
+        return None
+    anchor_item = min(upcoming, key=lambda item: item["date"])
+    teacher = (anchor_item.get("teacher") or "").strip()
+    if not teacher:
+        return None
+    earlier = [
+        item
+        for item in lessons
+        if (item.get("teacher") or "").strip() == teacher and item["date"] < anchor_item["date"]
+    ]
+    if not earlier:
+        return None
+    target = max(earlier, key=lambda item: item["date"])
+    begin, end = anchor_item.get("begin") or "", anchor_item.get("end") or ""
+    return {
+        "anchor_date": anchor_item["date"],
+        "anchor_teacher": teacher,
+        "anchor_lesson": (anchor_item.get("lesson") or "").replace(",", "、"),
+        "anchor_time": f"{begin}-{end}" if begin and end else "",
+        "row_date": target["date"],
+    }
+
+
+async def _locate_row(
+    page: Any, step: StepSpec, target_date: str, key: str
+) -> tuple[Any, str, int] | None:
+    """翻页找到「上课日期 + 老师」匹配的行，返回目标单元格、单元格文本和行号。
+
+    找到即停，不再把整张表翻完，也不用来回切页。
+    """
+    max_pages = max(1, step.max_pages or 20)
+    cell_index = -1
+    for _ in range(max_pages):
+        rows = await _scan_row_page(page, step)
+        for row_index, row in enumerate(rows):
+            if row["date"] != target_date or row["key"] != key:
+                continue
+            if cell_index < 0:
+                cell_index = await _cell_index(page, step)
+            row_el = page.locator(step.selector).nth(row_index)
+            return row_el.locator("td").nth(cell_index), row.get("cell_text", ""), row_index
+        if not step.next_selector:
+            break
+        nxt = page.locator(step.next_selector).first
+        if await nxt.count() == 0:
+            break
+        if await nxt.get_attribute("disabled") is not None:
+            break
+        if "disabled" in (await nxt.get_attribute("class") or ""):
+            break
+        signature = await _rows_signature(page, step.selector)
+        active = await _active_page(page)
+        await nxt.click()
+        await _wait_paging(page, step.selector, signature, active)
+    return None
+
+
+async def _pick_target(
+    page: Any,
+    step: StepSpec,
+    params: dict[str, Any],
+    cell: Any,
+    cell_text: str,
+    picked: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    """按目标单元格文本决定：`--` 直接给「未布置」结论，否则返回可点击元素。"""
     if cell_text in ("", "--", "-"):
         student = str(substitute(step.value, params)) if step.value else ""
-        shot = await _snapshot(page, student, target_data["date"], "未布置")
-        picked = {
-            "anchor_date": anchor_data["date"],
-            "anchor_teacher": key,
-            "anchor_lesson": anchor_data.get("lesson", ""),
-            "anchor_time": anchor_time,
-            "key": key,
-            "row_date": target_data["date"],
+        shot = await _snapshot(page, student, picked["row_date"], "未布置")
+        return None, {
+            **picked,
             "cell_text": cell_text or "--",
             "status": "未布置",
             "no_detail": True,
-            "message": f"{key}｜{target_data['date']} 该次课未布置作业，无作业完成情况",
+            "message": f"{picked['anchor_teacher']}｜{picked['row_date']} 该次课未布置作业，无作业完成情况",
             "screenshot": shot,
         }
-        return None, picked
 
     target = cell
     inner = cell.locator("span, a, button")
@@ -1232,18 +1423,6 @@ async def _find_prev_row(page: Any, step: StepSpec, params: dict[str, Any]) -> t
         if (await element.inner_text()).strip() == cell_text:
             target = element
             break
-
-    picked = {
-        "anchor_date": anchor_data["date"],
-        "anchor_teacher": key,
-        "anchor_lesson": anchor_data.get("lesson", ""),
-        "anchor_time": anchor_time,
-        "key": key,
-        "row_date": target_data["date"],
-        "cell_text": cell_text,
-        "pages": len(collected),
-        "row_index": target_row,
-    }
     return target, picked
 
 

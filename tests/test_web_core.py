@@ -10,7 +10,14 @@ import pytest
 from mcp_common.errors import ToolError
 from mcp_web import extract
 from mcp_web.browser import BrowserManager
-from mcp_web.flow import FlowSpec, ParamSpec, load_flow, resolve_params, substitute
+from mcp_web.flow import (
+    FlowSpec,
+    ParamSpec,
+    _plan_from_lessons,
+    load_flow,
+    resolve_params,
+    substitute,
+)
 from mcp_web.policy import Policy
 
 FIXTURE = Path(__file__).parent / "fixtures" / "query.html"
@@ -47,6 +54,33 @@ def test_resolve_params_requires_required_param():
 def test_resolve_params_uses_defaults():
     spec = FlowSpec(name="x", steps=[], params=[ParamSpec(name="status", default="全部")])
     assert resolve_params(spec, {})["status"] == "全部"
+
+
+def test_plan_from_lessons_picks_anchor_and_previous():
+    lessons = [
+        {"date": "2026-11-22", "lesson": "27,28", "teacher": "张力文", "begin": "13:20", "end": "17:40"},
+        {"date": "2026-11-08", "lesson": "26", "teacher": "马倩丽", "begin": "09:00", "end": "11:00"},
+        {"date": "2026-11-01", "lesson": "26", "teacher": "张力文", "begin": "09:00", "end": "11:00"},
+        {"date": "2026-10-25", "lesson": "25", "teacher": "张力文", "begin": "09:00", "end": "11:00"},
+    ]
+
+    plan = _plan_from_lessons(lessons, "2026-11-16")
+
+    assert plan["anchor_date"] == "2026-11-22"
+    assert plan["anchor_teacher"] == "张力文"
+    assert plan["anchor_lesson"] == "27、28"
+    assert plan["anchor_time"] == "13:20-17:40"
+    assert plan["row_date"] == "2026-11-01"
+
+
+def test_plan_from_lessons_without_upcoming_returns_none():
+    lessons = [{"date": "2026-10-18", "lesson": "37", "teacher": "杨子璇", "begin": "", "end": ""}]
+    assert _plan_from_lessons(lessons, "2026-11-16") is None
+
+
+def test_plan_from_lessons_without_earlier_lesson_returns_none():
+    lessons = [{"date": "2026-11-22", "lesson": "27", "teacher": "王侠栋", "begin": "", "end": ""}]
+    assert _plan_from_lessons(lessons, "2026-11-16") is None
 
 
 def test_flow_rejects_unknown_action(tmp_path):

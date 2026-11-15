@@ -23,6 +23,8 @@ params:
 steps:
   - action: goto
     url: /talkweb/#/vueSystem5031/vueSystem5033/student-class-manage-class-list
+    # 批量连续查询时，相同地址不会真正重新加载，会保留上一位学生的筛选和旧表格
+    reload: true
 
   - action: wait_for
     selector: 'input[placeholder="学生姓名"]'
@@ -72,6 +74,13 @@ steps:
   # 等路由切换+接口返回，避免读到上一个页面残留的数据
   - action: wait_ready
     timeout_ms: 30000
+
+  # 身份校验：班级详情页必须出现该学生姓名，
+  # 防止批量连续执行时点到上一次查询残留的旧行、查到别人班里
+  - action: assert
+    text: "{{ student }}"
+    timeout_ms: 15000
+    message: "班级页没有出现学生「{{ student }}」，可能点到了上一次查询的班级"
 
   - action: wait_for
     selector: 'div.btn:has-text("学情/作业")'
