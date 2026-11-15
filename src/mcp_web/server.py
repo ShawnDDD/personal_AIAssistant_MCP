@@ -20,10 +20,9 @@ mcp = build_server(
     "web",
     instructions=(
         "在固定网页系统上执行查询类操作。"
-        "术语约定：用户说「一对一打卡」「一对一补打卡」时，指的就是查询高端配课表"
-        "（一对一班容的学员打卡情况），对应流程 erp_attendance_query，参数是日期范围；"
-        "用户说「班课打卡」时，指查询班级配课表；"
-        "用户没有明确是一对一还是班课时，两条都查。"
+        "业务口径（术语、参数、判定规则、结论格式、只读边界）见项目 skill："
+        ".trae/skills/work-assistant-query/SKILL.md，调用流程前先读它，不要自行解释"
+        "「一对一」「班课」等术语。"
         "探索页面用 web_open + web_snapshot(mode=outline)，看清元素后再用 web_fill / web_click / web_extract_table。"
         "固定流程写成 flows/*.yaml，用 web_flow_run 一键执行；先 web_flow_validate 校验，再 web_flow_dry_run 验证选择器。"
         "默认只读：点击提交/删除/审批等按钮会被拦截并返回 BLOCKED_MUTATION。"
